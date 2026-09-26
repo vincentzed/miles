@@ -1500,6 +1500,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
             parser.add_argument(
+                "--sc-skip-old-logprob",
+                action="store_true",
+                help="Skip the pre-update actor log-prob pass (unused by the score-centering loss).",
+            )
+            parser.add_argument("--sc-advantage-shift", type=float, default=0.0, help="Add a constant to advantages.")
+            parser.add_argument(
                 "--sc-stale-interval",
                 type=int,
                 default=1,

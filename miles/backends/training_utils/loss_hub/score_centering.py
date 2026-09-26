@@ -32,7 +32,7 @@ def importance_weights(
         return torch.where(inside, log_ratio.clamp(max=math.log(mis_high)).exp(), 0.0)
     if mode == "ppo":
         inside = ppo_in_band(log_ratio, positive, low=ppo_low, high=ppo_high)
-        return torch.where(inside, log_ratio.clamp(max=math.log(PPO_DUAL_CLIP)).exp(), 0.0)
+        return torch.where(inside, log_ratio.clamp(max=math.log(max(ppo_high, PPO_DUAL_CLIP))).exp(), 0.0)
     raise ValueError(f"Unknown score-centering importance weighting: {mode}")
 
 

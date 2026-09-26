@@ -41,11 +41,12 @@ def scale_grads(model: torch.nn.Module, factor: float) -> None:
             p.grad.mul_(factor)
 
 
-def token_count_all_reduce(count: torch.Tensor) -> float:
+def token_mean_grad_scale(count: torch.Tensor, dp_size: int) -> float:
+    """Factor turning FSDP's rank-averaged gradient of summed token losses into the paper's token mean."""
     count = count.detach().float().clone()
     if dist.is_initialized():
         dist.all_reduce(count)
-    return max(count.item(), 1.0)
+    return dp_size / max(count.item(), 1.0)
 
 
 def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: int) -> None:
@@ -55,12 +56,17 @@ def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: in
     zero (E_p[score] = 0), so any systematic motion is drift toward/away from the sampler.
     random_sign: one independent +-1 per sequence (seeded by rollout id); E[A | prefix] = 0.
     """
+    shift = getattr(args, "sc_advantage_shift", 0.0)
+    if shift:
+        # Dose knob for drift: A + c keeps the signal (covariance) and adds c * s-bar of drift.
+        rollout_data["advantages"] = [a + shift for a in rollout_data["advantages"]]
     mode = getattr(args, "sc_placebo_advantage", "none")
     if mode == "none":
         return
     advantages = rollout_data["advantages"]
     if mode == "random_sign":
-        generator = torch.Generator().manual_seed(args.seed * 7919 + rollout_id)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        generator = torch.Generator().manual_seed((args.seed * 7919 + rollout_id) * 65537 + rank)
         signs = torch.randint(0, 2, (len(advantages),), generator=generator) * 2 - 1
     else:
         signs = torch.full((len(advantages),), 1 if mode == "plus_one" else -1)
@@ -168,7 +174,7 @@ class DriftTracker:
         return total.item()
 
     def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], centered: bool) -> dict:
-        g_c = [g.float() for g in g_c]
+        g_c = [g.float().clone() for g in g_c]
         g_pg = [t.float() - c if centered else t.float() for t, c in zip(g_total, g_c, strict=True)]
         record = {
             "g_c_sq": self._dot(g_c, g_c),

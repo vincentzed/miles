@@ -497,10 +497,15 @@ class FSDPTrainRayActor(TrainRayActor):
                 ref_results = self._compute_log_prob("ref", data_iterator, num_microbatches, store_prefix="ref_")
             rollout_data.update(ref_results)
 
-        with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
-            actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
-        routing_replay.rewind()
-        rollout_data.update(actor_results)
+        if self.args.sc_skip_old_logprob:
+            # The score-centering loss ratios use the recorded rollout logprobs only; the pre-update
+            # actor forward (~30% of step time) is unused. Keep the key for downstream consumers.
+            rollout_data["log_probs"] = rollout_data["rollout_log_probs"]
+        else:
+            with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
+                actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
+            routing_replay.rewind()
+            rollout_data.update(actor_results)
 
         compute_advantages_and_returns(self.args, rollout_data)
         sc_research.apply_placebo_advantages(self.args, rollout_data, rollout_id)
@@ -552,14 +557,17 @@ class FSDPTrainRayActor(TrainRayActor):
                     if self._drift_tracker is not None:
                         step_batches.append(batch)
 
-                total_tokens = 1.0
+                grad_scale = 1.0
                 if self.args.sc_token_mean_loss:
                     assert self.args.calculate_per_token_loss, "--sc-token-mean-loss needs --calculate-per-token-loss"
+                    assert get_parallel_state().cp.size == 1, "--sc-token-mean-loss assumes no context parallelism"
                     # Paper normalization: sum over the optimizer batch's tokens / total tokens.
-                    total_tokens = sc_research.token_count_all_reduce(torch.stack(normalizers).sum())
-                    sc_research.scale_grads(self.model, 1.0 / total_tokens)
+                    grad_scale = sc_research.token_mean_grad_scale(
+                        torch.stack(normalizers).sum(), dist.get_world_size()
+                    )
+                    sc_research.scale_grads(self.model, grad_scale)
                 if self._drift_tracker is not None:
-                    self._observe_drift(rollout_id, step_id, step_batches, num_microbatches[step_id], total_tokens)
+                    self._observe_drift(rollout_id, step_id, step_batches, num_microbatches[step_id], grad_scale)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                 grad_norm = grad_norm.full_tensor().item()
@@ -630,9 +638,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
         return log_dict, normalizer
 
-    def _observe_drift(self, rollout_id, step_id, step_batches, num_microbatches, total_tokens) -> None:
+    def _observe_drift(self, rollout_id, step_id, step_batches, num_microbatches, grad_scale) -> None:
         """Extra backward of the centering term only; leaves the step's gradient untouched."""
-        g_total = [g.clone() for g in sc_research.grads_of(self.model)]
+        g_total = [None if g is None else g.clone() for g in sc_research.grads_of(self.model)]
         self.optimizer.zero_grad(set_to_none=True)
         self.args.sc_center_only = True
         try:
@@ -640,15 +648,17 @@ class FSDPTrainRayActor(TrainRayActor):
                 self._train_step(batch=batch, step_id=step_id, num_microbatches=num_microbatches)
         finally:
             self.args.sc_center_only = False
-        sc_research.scale_grads(self.model, 1.0 / total_tokens)
+        sc_research.scale_grads(self.model, grad_scale)
         g_c = sc_research.grads_of(self.model)
         centered = not self.args.disable_score_centering_correction
         record = self._drift_tracker.observe(g_total, g_c, centered=centered)
         record.update(kind="drift", rollout_id=rollout_id, step_id=step_id, lr=self.args.lr)
         sc_research.append_diag(self.args, record)
         for p, g in zip(self.model.parameters(), g_total, strict=True):
-            if p.grad is not None:
-                sc_research._local(p.grad).copy_(g)
+            if g is None:
+                continue
+            assert p.grad is not None, "centering pass produced no gradient for a trained parameter"
+            sc_research._local(p.grad).copy_(g)
 
     @timer
     def update_weights(self, info: "UpdatableEngines", sc_mode: str = "normal") -> int | None:  # type: ignore[override]

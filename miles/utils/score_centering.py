@@ -75,5 +75,13 @@ def validate_score_centering_args(args: Namespace) -> None:
             "Score-centering session rollouts with more than 20 candidates require --use-miles-router: "
             "the SGLang Rust router caps OpenAI top_logprobs at 20"
         )
+    if getattr(args, "sc_skip_old_logprob", False):
+        assert args.loss_type == "score_centering" and args.use_rollout_logprobs and not args.use_kl_loss
+    if getattr(args, "sc_drift_diag", False):
+        assert args.entropy_coef == 0 and not args.use_kl_loss, "--sc-drift-diag assumes no entropy/KL regularizer"
+    if getattr(args, "sc_placebo_advantage", "none") != "none":
+        assert args.sc_token_mean_loss, "placebo advantages need the batch-wide token mean (else 1/L acts as a reward)"
+    if getattr(args, "sc_weight_noise", 0.0) or getattr(args, "sc_stale_interval", 1) > 1:
+        assert args.load is None, "resume would redraw the noise / lose the stale snapshot"
     if os.environ.get("SGLANG_RETURN_ORIGINAL_LOGPROB", "").lower() in ("1", "true"):
         raise ValueError("Score centering requires SGLANG_RETURN_ORIGINAL_LOGPROB=0 on rollout servers")
