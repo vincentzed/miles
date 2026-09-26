@@ -71,6 +71,7 @@ def score_centering_loss(
     ppo_low: float = 0.8,
     ppo_high: float = 1.2,
     q_tail_floor: float | None = None,
+    center_scale: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return unreduced token losses and detached token metrics.
 
@@ -119,7 +120,8 @@ def score_centering_loss(
             ppo_high=ppo_high,
         )
     correction =(residual * head_log_probs).sum(-1)
-    applied_correction = correction if center else correction * 0.0
+    # center_scale (lambda) is a causal control: 0 = PG, 1 = SC, 2 = same-size drift of opposite sign.
+    applied_correction = correction * center_scale if center else correction * 0.0
     loss = -advantages.detach() * (weight * train_log_probs - applied_correction)
     if center_only:
         # Research diagnostic: gradient of the centering term alone (G_c), independent of `center`.
@@ -131,6 +133,9 @@ def score_centering_loss(
         "sc_train_head_mass": p_mass,
         "sc_rollout_head_mass": q_mass,
         "sc_tail_ratio": rho,
+        # ||q_hat - p||_1 of the modeled sampler distribution (head exact, tail rho*p): the logit-space
+        # size of the centering vector, i.e. the per-token drift magnitude.
+        "sc_head_l1": (q - p).abs().sum(-1) + (rho - 1).abs() * (1 - p_mass).clamp_min(0),
         "sc_importance_weight": weight,
     }
 

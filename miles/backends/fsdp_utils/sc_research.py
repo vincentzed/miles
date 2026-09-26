@@ -73,6 +73,41 @@ def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: in
     rollout_data["advantages"] = [torch.full_like(a, float(s)) for a, s in zip(advantages, signs.tolist())]
 
 
+# Mini-float grids (mantissa bits, max, min normal exponent), as in the paper's models/quant.py.
+_FLOAT_GRIDS = {"fp8": (3, 448.0, -6), "fp6": (2, 28.0, -2), "fp4": (1, 6.0, 0)}
+
+
+def _snap_float(x: torch.Tensor, fmt: str) -> torch.Tensor:
+    man_bits, max_val, min_normal_exp = _FLOAT_GRIDS[fmt]
+    ax = x.abs()
+    exp = torch.floor(torch.log2(ax.clamp_min(1e-30)))
+    quantum = torch.exp2(exp.clamp_min(min_normal_exp) - man_bits)
+    return torch.sign(x) * torch.minimum(torch.round(ax / quantum) * quantum, torch.tensor(max_val, device=x.device))
+
+
+def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0) -> torch.Tensor:
+    """Weight-only quantize-dequantize, port of the paper's fake_quantize_tree (models/quant.py).
+
+    Symmetric absmax scale per output row over the contraction (last) axis, optionally in groups.
+    Skips 1-D tensors, norms, biases and MoE routers. fmt: int8 | int4 | intN | fp8 | fp6 | fp4.
+    """
+    if w.ndim <= 1 or "norm" in name or "bias" in name or name.endswith("mlp.gate.weight"):
+        return w
+    shape = w.shape
+    k = shape[-1]
+    g = group_size or k
+    assert k % g == 0, f"{name}: contraction {k} not divisible by group {g}"
+    x = w.float().reshape(*shape[:-1], k // g, g)
+    if fmt.startswith("int"):
+        qmax = float(2 ** (int(fmt[3:]) - 1) - 1)
+        scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / qmax
+        q = torch.round(x / scale).clamp(-qmax, qmax)
+    else:
+        scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / _FLOAT_GRIDS[fmt][1]
+        q = _snap_float(x / scale, fmt)
+    return (q * scale).reshape(shape).to(w.dtype)
+
+
 class SamplerView:
     """What the rollout engine receives on each weight sync (research knobs, all opt-in).
 
@@ -89,11 +124,14 @@ class SamplerView:
         self.sigma = getattr(args, "sc_weight_noise", 0.0)
         self.interval = max(1, getattr(args, "sc_stale_interval", 1))
         self.keep_snapshot = self.interval > 1 or getattr(args, "sc_clean_eval", False)
-        self.enabled = bool(self.sigma) or self.keep_snapshot
+        self.fake_quant = getattr(args, "sc_sampler_weight_quant", None)
+        self.fake_quant_group = getattr(args, "sc_sampler_weight_quant_group", 0)
+        self.enabled = bool(self.sigma) or self.keep_snapshot or bool(self.fake_quant)
         tied = getattr(getattr(model, "config", None), "tie_word_embeddings", False)
         self._alias = {"lm_head.weight": "model.embed_tokens.weight"} if tied else {}
         self.deltas: dict[str, torch.Tensor] = {}
         self.theta0: dict[str, torch.Tensor] = {}
+        self.sham: dict[str, torch.Tensor] = {}  # never applied: null for the Delta-projection
         self.snapshot: dict[str, torch.Tensor] = {}
         self.normal_syncs = 0
         self.mode = "normal"
@@ -105,7 +143,7 @@ class SamplerView:
         if mode == "normal":
             self.normal_syncs += 1
             self.refresh = (self.normal_syncs - 1) % self.interval == 0
-        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0}
+        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0, "sham_proj": 0.0, "sham_sq": 0.0}
 
     def transform(self, name: str, full: torch.Tensor, target_dtype: torch.dtype | None) -> torch.Tensor:
         sent_dtype = target_dtype or full.dtype
@@ -122,13 +160,22 @@ class SamplerView:
                 eps = torch.randn(full.shape, generator=generator, device=full.device, dtype=torch.float32)
                 self.deltas[key] = (self.sigma * eps * full.float()).to(sent_dtype)
                 self.theta0[key] = full.detach().float().clone()
+                sham = torch.Generator(device=full.device).manual_seed(seed ^ 0x5DEECE66D)
+                eps = torch.randn(full.shape, generator=sham, device=full.device, dtype=torch.float32)
+                self.sham[key] = (self.sigma * eps * full.float()).to(sent_dtype)
             if key == name:  # count tied weights once
                 delta = self.deltas[key].float()
                 disp = full.float() - self.theta0[key]
                 self._stats["proj"] += (disp * delta).sum().item()
                 self._stats["disp_sq"] += disp.square().sum().item()
                 self._stats["delta_sq"] += delta.square().sum().item()
+                sham = self.sham[key].float()
+                self._stats["sham_proj"] += (disp * sham).sum().item()
+                self._stats["sham_sq"] += sham.square().sum().item()
             out = out + self.deltas[key]  # paper: bf16 weight + bf16 delta
+        if self.fake_quant:
+            # Re-applied on every sync, so the error tracks the current weights (paper: noise, then quant).
+            out = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group)
         if self.keep_snapshot:
             self.snapshot[name] = out.detach().to("cpu", copy=True)
         return out
@@ -142,6 +189,8 @@ class SamplerView:
                 delta_cos=s["proj"] / max((s["disp_sq"] * s["delta_sq"]) ** 0.5, 1e-30),
                 disp_norm=s["disp_sq"] ** 0.5,
                 delta_norm=s["delta_sq"] ** 0.5,
+                sham_proj=s["sham_proj"] / max(s["sham_sq"], 1e-30),
+                sham_cos=s["sham_proj"] / max((s["disp_sq"] * s["sham_sq"]) ** 0.5, 1e-30),
             )
         append_diag(self.args, record)
 
@@ -152,8 +201,9 @@ class DriftTracker:
     With the score-centering loss L = -A (w log p - c), G_total = G_pg + G_c where G_c = grad(A c).
     For a PG arm (centering disabled) the applied gradient is G_pg; for an SC arm it is G_pg + G_c.
     Under SGD, theta_T - theta_0 = -lr * sum_t G_t exactly, so the running sums of G_c and G_pg
-    give the accumulated drift vs signal displacement. Cross-step inner products use independent
-    batches, so <G_t, G_{t-1}> is unbiased for <E G_t, E G_{t-1}> (persistence without noise bias).
+    give the accumulated drift vs signal displacement. Cross-step inner products use different
+    batches but are NOT unbiased: step t's weights depend on batch t-1, so E<G_t, G_{t-1}> carries an
+    O(lr * tr(H Sigma)) term. Treat them as descriptive; the sum-norm growth rate is the main statistic.
     """
 
     def __init__(self, model: torch.nn.Module):
@@ -173,9 +223,10 @@ class DriftTracker:
             dist.all_reduce(total)
         return total.item()
 
-    def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], centered: bool) -> dict:
+    def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], center_scale: float) -> dict:
+        """center_scale = lambda actually applied (0 for PG arms): G_total = G_pg + lambda * G_c."""
         g_c = [g.float().clone() for g in g_c]
-        g_pg = [t.float() - c if centered else t.float() for t, c in zip(g_total, g_c, strict=True)]
+        g_pg = [t.float() - center_scale * c for t, c in zip(g_total, g_c, strict=True)]
         record = {
             "g_c_sq": self._dot(g_c, g_c),
             "g_pg_sq": self._dot(g_pg, g_pg),

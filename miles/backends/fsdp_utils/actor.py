@@ -650,8 +650,8 @@ class FSDPTrainRayActor(TrainRayActor):
             self.args.sc_center_only = False
         sc_research.scale_grads(self.model, grad_scale)
         g_c = sc_research.grads_of(self.model)
-        centered = not self.args.disable_score_centering_correction
-        record = self._drift_tracker.observe(g_total, g_c, centered=centered)
+        center_scale = 0.0 if self.args.disable_score_centering_correction else self.args.sc_center_scale
+        record = self._drift_tracker.observe(g_total, g_c, center_scale=center_scale)
         record.update(kind="drift", rollout_id=rollout_id, step_id=step_id, lr=self.args.lr)
         sc_research.append_diag(self.args, record)
         for p, g in zip(self.model.parameters(), g_total, strict=True):

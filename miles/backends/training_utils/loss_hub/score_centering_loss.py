@@ -139,6 +139,7 @@ def score_centering_loss_function(
         ppo_low=args.score_centering_ppo_low,
         ppo_high=args.score_centering_ppo_high,
         q_tail_floor=args.sc_q_tail_floor,
+        center_scale=args.sc_center_scale,
     )
     pg_loss = sum_of_sample_mean(token_loss)
     entropy = torch.cat(probabilities["entropy"]) if "entropy" in probabilities else None

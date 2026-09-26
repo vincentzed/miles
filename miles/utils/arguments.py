@@ -1500,6 +1500,19 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
             parser.add_argument(
+                "--sc-center-scale",
+                type=float,
+                default=1.0,
+                help="Multiply the centering term by lambda (causal control; 2 = equal-size drift, opposite sign).",
+            )
+            parser.add_argument(
+                "--sc-sampler-weight-quant",
+                type=str,
+                default=None,
+                help="Weight-only fake quant of the synced sampler weights: int8|int4|intN|fp8|fp6|fp4 (paper quant.py).",
+            )
+            parser.add_argument("--sc-sampler-weight-quant-group", type=int, default=0)
+            parser.add_argument(
                 "--sc-skip-old-logprob",
                 action="store_true",
                 help="Skip the pre-update actor log-prob pass (unused by the score-centering loss).",
