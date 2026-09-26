@@ -151,6 +151,18 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
         qmax = float(2 ** (int(fmt[3:]) - 1) - 1)
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / qmax
         q = torch.round(x / scale).clamp(-qmax, qmax)
+    elif fmt in ("nvfp4te", "nvfp4te46"):
+        # The miles NVFP4 RL recipe's quantizer (radixark/miles #2864, the humans& W4A16 fake-QAT recipe):
+        # Transformer-Engine-exact NVFP4 (E2M1, 1x16 blocks, E4M3 block scales, FP32 per-tensor amax) via the fused
+        # CuTe DSL QDQ kernel; nvfp4te46 adds Four-Over-Six with the MSE criterion and FP16 candidate-error math,
+        # E4M3 max 448 (NVTE_NVFP4_4OVER6=weights, ERR_MODE=MSE, ERR_USE_FAST_MATH=1, E4M3_USE_256=none).
+        from miles.utils.fused_nvfp4_qdq import NVFP4QDQConfig, NVFP4QDQErrorMode, compute_nvfp4_amax, fused_nvfp4_qdq
+
+        assert g == 16 and w.is_cuda and w.dtype == torch.bfloat16, "TE NVFP4 contract: CUDA bf16, 1x16 blocks"
+        cfg = (NVFP4QDQConfig(use_4over6=True, e4m3_max=448, error_mode=NVFP4QDQErrorMode.MSE, error_use_fast_math=True)
+               if fmt == "nvfp4te46" else NVFP4QDQConfig())
+        x2 = w.reshape(-1, k).contiguous()
+        return fused_nvfp4_qdq(x2, compute_nvfp4_amax(x2), cfg).reshape(shape).to(w.dtype)
     elif fmt == "nvfp4":
         # NVFP4-like: E2M1 values, per-16 block scales stored in E4M3, one fp32 per-tensor scale (amax / (6 * 448)).
         assert g == 16, "nvfp4 uses 16-element blocks"
