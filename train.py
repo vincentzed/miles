@@ -204,6 +204,8 @@ async def _dispatch_eval(args, actor_model, rollout_executor, eval_dispatcher, r
     await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="clean")
     await eval_dispatcher.dispatch(rollout_id, **kwargs)
     await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="restore")
+    if args.sc_sampler_eval:
+        await eval_dispatcher.dispatch(rollout_id, **kwargs)
 
 
 if __name__ == "__main__":

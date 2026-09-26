@@ -1550,6 +1550,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Evaluate with clean trainer weights (no synthetic noise), re-syncing the noisy sampler after.",
             )
             parser.add_argument(
+                "--sc-sampler-eval",
+                action="store_true",
+                help=(
+                    "With --sc-clean-eval, also evaluate the deployed (noisy/stale) sampler policy after restoring it. "
+                    "The second pass is logged as eval/<name>_sampler by sc_ext.eval_log.log_eval "
+                    "(--custom-eval-rollout-log-function-path)."
+                ),
+            )
+            parser.add_argument(
                 "--sc-weight-noise",
                 type=float,
                 default=0.0,
