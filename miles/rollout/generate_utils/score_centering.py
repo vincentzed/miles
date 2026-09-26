@@ -81,26 +81,32 @@ def append_score_centering_topk(sample: Sample, meta: Mapping[str, Any], k: int)
             setattr(sample, field, np.concatenate((previous, values)))
 
 
-def apply_filtered_support(sample: Sample, meta: Mapping[str, Any], n: int) -> None:
+def apply_filtered_support(sample: Sample, meta: Mapping[str, Any], n: int) -> list[int]:
     """Replace the last n rows of pre-filter candidates by the post-filter sampling distribution q^F.
 
     SGLang returns top-k logprobs and the sampled-token logprob *before* top-p/top-k/min-p filtering,
     plus (return_sampling_mask) the support S each token was actually drawn from. Every such filter keeps a
     prefix of the probability-sorted vocabulary, so S is the first |S| candidates whenever |S| <= k; then
-    log q^F_v = log q_v - logsumexp_S log q for v in S and 0 mass elsewhere (exact). If |S| > k the head is
-    truncated to the k best and renormalized over them (approximation; counted in sample.metadata).
+    log q^F_v = log q_v - logsumexp_S log q for v in S and 0 mass elsewhere (exact). top_k is capped at k, so a
+    support token outside the recorded head only arises from ties/rounding at the head boundary (~1 position per
+    10^6); such positions must be dropped from the loss rather than centered against a partial support: their
+    response indices are returned (the caller zeroes them after updating loss_mask) and counted in
+    sample.metadata["sc_support_truncated"].
     """
     masks = meta.get("output_token_sampling_mask")
     if masks is None or len(masks) != n:
         raise ValueError("Filtered score centering needs output_token_sampling_mask for every generated token")
     ids, logps = sample.rollout_topk_token_ids, sample.rollout_topk_log_probs
     start = sample.response_length - n
-    truncated = 0
+    dropped = []
     for i, support in enumerate(masks):
         row = start + i
         head = {int(t): j for j, t in enumerate(ids[row]) if t >= 0}
         keep = [head[int(t)] for t in support if int(t) in head]
-        truncated += len(keep) < len(support)
+        if len(keep) < len(support):
+            dropped.append(row)
+            if not keep:
+                continue
         lq = logps[row, keep].astype(np.float64)
         log_z = float(np.logaddexp.reduce(lq))
         new_ids = np.full(ids.shape[1], -1, dtype=np.int32)
@@ -109,8 +115,9 @@ def apply_filtered_support(sample: Sample, meta: Mapping[str, Any], n: int) -> N
         new_lp[: len(keep)] = (lq - log_z).astype(np.float32)
         ids[row], logps[row] = new_ids, new_lp
         sample.rollout_log_probs[row] = float(sample.rollout_log_probs[row] - log_z)
-    if truncated:
-        raise ValueError(f"{truncated} positions have sampling support outside the recorded head (top_k must be <= k)")
+    if dropped:
+        sample.metadata = {**(sample.metadata or {}), "sc_support_truncated": len(dropped)}
+    return dropped
 
 
 def append_score_centering_observations(sample: Sample, count: int) -> None:

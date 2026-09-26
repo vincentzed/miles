@@ -108,15 +108,21 @@ async def update_sample_from_response(
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
     sample.rollout_log_probs += new_response_log_probs
+    dropped = []
     if payload.get("top_logprobs_num"):
         append_score_centering_topk(sample, output["meta_info"], score_centering_top_k(args))
         if payload.get("return_sampling_mask"):
-            apply_filtered_support(sample, output["meta_info"], len(new_response_tokens))
+            dropped = apply_filtered_support(sample, output["meta_info"], len(new_response_tokens))
 
     if update_loss_mask:
         if sample.loss_mask is None:
             sample.loss_mask = []
         sample.loss_mask += [1] * len(new_response_tokens)
+    if dropped:  # positions whose sampling support left the recorded head (see apply_filtered_support)
+        if sample.loss_mask is None:
+            sample.loss_mask = [1] * sample.response_length
+        for row in dropped:
+            sample.loss_mask[row] = 0
 
     # TODO handle multi-turn cases (may need concat instead of assignment)
     sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
