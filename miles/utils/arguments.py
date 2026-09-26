@@ -1469,7 +1469,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--score-centering-is",
-                choices=["none", "tis", "mis"],
+                choices=["none", "tis", "mis", "ppo", "ppo_old"],
                 default="none",
                 help="Importance weights to center together with the policy score.",
             )
@@ -1477,6 +1477,20 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--disable-score-centering-correction",
                 action="store_true",
                 help="Ablate only score centering while retaining identical importance weights and diagnostics.",
+            )
+            parser.add_argument("--score-centering-ppo-low", type=float, default=0.8)
+            parser.add_argument("--score-centering-ppo-high", type=float, default=1.2)
+            parser.add_argument(
+                "--sc-q-tail-floor",
+                type=float,
+                default=None,
+                help="Floor for the sampler tail mass in rho (default eps=1e-6; the paper's training code uses 0).",
+            )
+            parser.add_argument(
+                "--sc-center-scale",
+                type=float,
+                default=1.0,
+                help="Multiply the centering term by lambda (causal control; 2 = equal-size drift, opposite sign).",
             )
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)

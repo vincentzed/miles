@@ -99,6 +99,16 @@ def _regularization(
     return loss, metrics
 
 
+def _old_policy_inputs(args, batch, active, device) -> dict:
+    if args.score_centering_is != "ppo_old":
+        return {}
+    old_token = torch.cat([torch.as_tensor(x) for x in batch["old_token_log_probs"]]).to(device)
+    return {
+        "old_log_probs": torch.where(active, old_token, 0.0),
+        "old_head_log_probs": _local_candidates(args, batch, "old_topk_log_probs", device),
+    }
+
+
 def score_centering_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -135,6 +145,11 @@ def score_centering_loss_function(
         tis_clip=args.score_centering_tis_clip,
         mis_low=args.score_centering_mis_low,
         mis_high=args.score_centering_mis_high,
+        ppo_low=args.score_centering_ppo_low,
+        ppo_high=args.score_centering_ppo_high,
+        q_tail_floor=args.sc_q_tail_floor,
+        center_scale=args.sc_center_scale,
+        **_old_policy_inputs(args, batch, active, logits.device),
     )
     pg_loss = sum_of_sample_mean(token_loss)
     entropy = torch.cat(probabilities["entropy"]) if "entropy" in probabilities else None

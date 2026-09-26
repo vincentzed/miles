@@ -18,6 +18,9 @@ def importance_weights(
     tis_clip: float = 2.0,
     mis_low: float = 0.5,
     mis_high: float = 5.0,
+    positive: torch.Tensor | None = None,
+    ppo_low: float = 0.8,
+    ppo_high: float = 1.2,
 ) -> torch.Tensor:
     """Evaluate token-level weights without exponentiating unbounded ratios."""
     if mode == "none":
@@ -27,7 +30,27 @@ def importance_weights(
     if mode == "mis":
         inside = (log_ratio >= math.log(mis_low)) & (log_ratio <= math.log(mis_high))
         return torch.where(inside, log_ratio.clamp(max=math.log(mis_high)).exp(), 0.0)
+    if mode == "ppo":
+        inside = ppo_in_band(log_ratio, positive, low=ppo_low, high=ppo_high)
+        return torch.where(inside, log_ratio.clamp(max=math.log(max(ppo_high, PPO_DUAL_CLIP))).exp(), 0.0)
     raise ValueError(f"Unknown score-centering importance weighting: {mode}")
+
+
+PPO_DUAL_CLIP = 3.0
+
+
+def ppo_in_band(log_ratio: torch.Tensor, positive: torch.Tensor, *, low: float, high: float) -> torch.Tensor:
+    """PPO's pessimistic clip as a detached REINFORCE weight (paper code, losses.py:151-160).
+
+    Gradient-identical to the clipped surrogate: A >= 0 keeps r <= high, A < 0 keeps
+    low <= r <= 3 (dual clip); outside the band the token is dropped. The band depends on
+    sign(A), so centering is done conditionally on the sign (losses.py:192-196).
+    """
+    if positive.dim() < log_ratio.dim():
+        positive = positive.unsqueeze(-1)
+    upper = torch.where(positive, math.log(high), math.log(PPO_DUAL_CLIP))
+    lower = torch.where(positive, -math.inf, math.log(low))
+    return (log_ratio <= upper) & (log_ratio >= lower)
 
 
 def score_centering_loss(
@@ -44,6 +67,12 @@ def score_centering_loss(
     mis_high: float = 5.0,
     eps: float = 1e-6,
     center: bool = True,
+    ppo_low: float = 0.8,
+    ppo_high: float = 1.2,
+    q_tail_floor: float | None = None,
+    center_scale: float = 1.0,
+    old_log_probs: torch.Tensor | None = None,
+    old_head_log_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return unreduced token losses and detached token metrics.
 
@@ -57,7 +86,10 @@ def score_centering_loss(
         p = head_log_probs.exp().masked_fill(~head_mask, 0.0)
         q = rollout_head_log_probs.exp().masked_fill(~head_mask, 0.0)
         p_mass, q_mass = p.sum(-1), q.sum(-1)
-        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
+        # The paper's appendix snippet floors the sampler tail at eps; its training code floors at 0.
+        q_floor = eps if q_tail_floor is None else q_tail_floor
+        rho = (1 - q_mass).clamp_min(q_floor) / (1 - p_mass).clamp_min(eps)
+        positive = advantages.detach() >= 0
         if mode == "none":
             weighted_q, alpha = q, rho
         elif mode == "tis":
@@ -68,19 +100,45 @@ def score_centering_loss(
             inside = (log_ratio >= math.log(mis_low)) & (log_ratio <= math.log(mis_high))
             weighted_q = torch.where(inside & head_mask, p, 0.0)
             alpha = ((rho >= 1 / mis_high) & (rho <= 1 / mis_low)).to(p.dtype)
+        elif mode == "ppo_old":
+            # PPO clipped against pi_old (trainer at batch start), rollouts from the sampler q. Weight
+            # w = r_old 1{band(r_old, sign A)}, r_old = p/pi_old; centering integrates q * w under q:
+            # head q_v p_v/pi_old_v in band; tail q = rho p, pi_old = rho_o p -> alpha = (rho/rho_o) 1{band(1/rho_o)}.
+            old_head = torch.where(head_mask, old_head_log_probs, 0.0)
+            log_r = head_log_probs - old_head
+            inside = ppo_in_band(log_r, positive, low=ppo_low, high=ppo_high)
+            weighted_q = torch.where(inside & head_mask, q * log_r.exp(), 0.0)
+            old_mass = old_head.exp().masked_fill(~head_mask, 0.0).sum(-1)
+            rho_o = (1 - old_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
+            tail_in = ppo_in_band(-rho_o.log(), positive, low=ppo_low, high=ppo_high).to(p.dtype)
+            alpha = rho / rho_o * tail_in
+        elif mode == "ppo":
+            # In band the effective mass q * (p/q) is p; out of band it is 0. The modeled tail has
+            # constant ratio 1/rho, so alpha = rho * w(1/rho) = 1{1/rho in band}.
+            inside = ppo_in_band(head_log_probs - rollout_head_log_probs, positive, low=ppo_low, high=ppo_high)
+            weighted_q = torch.where(inside & head_mask, p, 0.0)
+            tail_log_ratio = -rho.clamp_min(1e-30).log()
+            alpha = ppo_in_band(tail_log_ratio, positive, low=ppo_low, high=ppo_high).to(p.dtype)
         else:
             raise ValueError(f"Unknown score-centering importance weighting: {mode}")
         residual = weighted_q - alpha.unsqueeze(-1) * p
         weight = importance_weights(
-            train_log_probs - rollout_log_probs,
-            mode,
+            train_log_probs - (old_log_probs if mode == "ppo_old" else rollout_log_probs),
+            "ppo" if mode == "ppo_old" else mode,
             tis_clip=tis_clip,
             mis_low=mis_low,
             mis_high=mis_high,
+            positive=positive,
+            ppo_low=ppo_low,
+            ppo_high=ppo_high,
         )
     correction = (residual * head_log_probs).sum(-1)
-    applied_correction = correction if center else correction * 0.0
+    # center_scale (lambda) is a causal control: 0 = PG, 1 = SC, 2 = same-size drift of opposite sign.
+    applied_correction = correction * center_scale if center else correction * 0.0
     loss = -advantages.detach() * (weight * train_log_probs - applied_correction)
+    kl_q_p = (q * (rollout_head_log_probs.masked_fill(~head_mask, 0.0) - head_log_probs)).sum(-1) + (
+        1 - q_mass
+    ).clamp_min(0) * rho.clamp_min(1e-30).log()
     return loss, {
         "sc_correction": applied_correction.detach(),
         "sc_uncentered_correction": correction.detach(),
@@ -88,6 +146,23 @@ def score_centering_loss(
         "sc_train_head_mass": p_mass,
         "sc_rollout_head_mass": q_mass,
         "sc_tail_ratio": rho,
+        # KL over the sampler head + modeled tail (q_tail = rho p_tail): forward KL(q||p) is what PG drift
+        # self-distills toward (round-11 framing); reverse KL(p||q) for contrast.
+        "sc_kl_q_p": kl_q_p,
+        # value-weighted mismatch proxies from quantities any stack has (phase diagram, idea I1)
+        "sc_adv_x_kl": advantages.detach() * kl_q_p,
+        "sc_absadv_x_kl": advantages.detach().abs() * kl_q_p,
+        "sc_frac_nonzero_adv": (advantages.detach() != 0).float(),
+        "sc_kl_p_q": (p * (head_log_probs - rollout_head_log_probs.masked_fill(~head_mask, 0.0))).sum(-1)
+        - (1 - p_mass).clamp_min(0) * rho.clamp_min(1e-30).log(),
+        # MIPU-style sign readout independent of length: token-level log(p/q) weighted by advantage
+        "sc_logratio_x_adv": (train_log_probs.detach() - rollout_log_probs) * advantages.detach(),
+        "sc_logratio": train_log_probs.detach() - rollout_log_probs,
+        # sampler mass in its own top-128 (comparable across k; for k > 128 the head is sorted by q)
+        "sc_rollout_head_mass_top128": q[..., :128].sum(-1),
+        # ||q_hat - p||_1 of the modeled sampler distribution (head exact, tail rho*p): the logit-space
+        # size of the centering vector, i.e. the per-token drift magnitude.
+        "sc_head_l1": (q - p).abs().sum(-1) + (rho - 1).abs() * (1 - p_mass).clamp_min(0),
         "sc_importance_weight": weight,
     }
 
