@@ -140,6 +140,9 @@ def score_centering_loss(
     if center_only:
         # Research diagnostic: gradient of the centering term alone (G_c), independent of `center`.
         loss = advantages.detach() * correction
+    kl_q_p = (q * (rollout_head_log_probs.masked_fill(~head_mask, 0.0) - head_log_probs)).sum(-1) + (
+        1 - q_mass
+    ).clamp_min(0) * rho.clamp_min(1e-30).log()
     return loss, {
         "sc_correction": applied_correction.detach(),
         "sc_uncentered_correction": correction.detach(),
@@ -149,8 +152,11 @@ def score_centering_loss(
         "sc_tail_ratio": rho,
         # KL over the sampler head + modeled tail (q_tail = rho p_tail): forward KL(q||p) is what PG drift
         # self-distills toward (round-11 framing); reverse KL(p||q) for contrast.
-        "sc_kl_q_p": (q * (rollout_head_log_probs.masked_fill(~head_mask, 0.0) - head_log_probs)).sum(-1)
-        + (1 - q_mass).clamp_min(0) * rho.clamp_min(1e-30).log(),
+        "sc_kl_q_p": kl_q_p,
+        # value-weighted mismatch proxies from quantities any stack has (phase diagram, idea I1)
+        "sc_adv_x_kl": advantages.detach() * kl_q_p,
+        "sc_absadv_x_kl": advantages.detach().abs() * kl_q_p,
+        "sc_frac_nonzero_adv": (advantages.detach() != 0).float(),
         "sc_kl_p_q": (p * (head_log_probs - rollout_head_log_probs.masked_fill(~head_mask, 0.0))).sum(-1)
         - (1 - p_mass).clamp_min(0) * rho.clamp_min(1e-30).log(),
         # MIPU-style sign readout independent of length: token-level log(p/q) weighted by advantage
