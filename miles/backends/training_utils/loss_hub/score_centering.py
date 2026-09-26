@@ -147,6 +147,15 @@ def score_centering_loss(
         "sc_train_head_mass": p_mass,
         "sc_rollout_head_mass": q_mass,
         "sc_tail_ratio": rho,
+        # KL over the sampler head + modeled tail (q_tail = rho p_tail): forward KL(q||p) is what PG drift
+        # self-distills toward (round-11 framing); reverse KL(p||q) for contrast.
+        "sc_kl_q_p": (q * (rollout_head_log_probs.masked_fill(~head_mask, 0.0) - head_log_probs)).sum(-1)
+        + (1 - q_mass).clamp_min(0) * rho.clamp_min(1e-30).log(),
+        "sc_kl_p_q": (p * (head_log_probs - rollout_head_log_probs.masked_fill(~head_mask, 0.0))).sum(-1)
+        - (1 - p_mass).clamp_min(0) * rho.clamp_min(1e-30).log(),
+        # MIPU-style sign readout independent of length: token-level log(p/q) weighted by advantage
+        "sc_logratio_x_adv": (train_log_probs.detach() - rollout_log_probs) * advantages.detach(),
+        "sc_logratio": train_log_probs.detach() - rollout_log_probs,
         # sampler mass in its own top-128 (comparable across k; for k > 128 the head is sorted by q)
         "sc_rollout_head_mass_top128": q[..., :128].sum(-1),
         # ||q_hat - p||_1 of the modeled sampler distribution (head exact, tail rho*p): the logit-space

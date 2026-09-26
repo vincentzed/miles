@@ -56,8 +56,23 @@ def log_advantage_stats(args: Namespace, rollout_data: dict, rollout_id: int) ->
         return
     adv = torch.tensor([float(a[0]) if len(a) else 0.0 for a in rollout_data["advantages"]], dtype=torch.float64)
     lens = torch.tensor([float(x) for x in rollout_data["response_lengths"]], dtype=torch.float64)
+    # within-group corr(R, sequence log q) (Power-distribution paper, Prop. 3) and a repetition readout
+    seq_logq = torch.tensor([float(sum(x)) for x in rollout_data["rollout_log_probs"]], dtype=torch.float64)
+    g = 8
+    corrs = []
+    for i in range(0, len(adv) - g + 1, g):
+        a, lq = adv[i : i + g], seq_logq[i : i + g]
+        if a.std() > 0 and lq.std() > 0:
+            corrs.append(float(torch.corrcoef(torch.stack([a, lq]))[0, 1]))
+    rep = []
+    for toks, L in zip(rollout_data["tokens"], rollout_data["response_lengths"]):
+        resp = [int(t) for t in toks[-int(L):]] if int(L) else []
+        grams = [tuple(resp[j : j + 4]) for j in range(max(len(resp) - 3, 0))]
+        rep.append(1 - len(set(grams)) / len(grams) if grams else 0.0)
     record = {
         "kind": "adv",
+        "within_group_corr_adv_logq": float(sum(corrs) / len(corrs)) if corrs else None,
+        "repeat_4gram_frac": float(sum(rep) / max(len(rep), 1)),
         "rollout_id": rollout_id,
         "token_weighted_adv": float((adv * lens).sum() / lens.sum().clamp_min(1)),
         "cov_adv_len": float(((adv - adv.mean()) * (lens - lens.mean())).mean()),
