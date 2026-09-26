@@ -131,6 +131,19 @@ def q_checksum(t: torch.Tensor) -> int:
     return int((bits * weights).sum().item())
 
 
+_ACT46_MASKS: dict | None = None
+
+
+def _act46_masks() -> dict:
+    global _ACT46_MASKS
+    if _ACT46_MASKS is None:
+        from safetensors.torch import load_file
+
+        path = os.environ.get("SC_NVFP4_ACT46_MASK", "/root/score-centering/sc-followups/data/nvfp4_46act_mask.safetensors")
+        _ACT46_MASKS = load_file(path)
+    return _ACT46_MASKS
+
+
 def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0, skip_embed: bool = False) -> torch.Tensor:
     """Weight-only quantize-dequantize, port of the paper's fake_quantize_tree (models/quant.py).
 
@@ -151,6 +164,18 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
         qmax = float(2 ** (int(fmt[3:]) - 1) - 1)
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / qmax
         q = torch.round(x / scale).clamp(-qmax, qmax)
+    elif fmt == "nvfp4te46act":
+        # Activation-aware Four-Over-Six: a fixed per-block mask (computed once from base-model calibration activations,
+        # scripts/make_46act_mask.py) picks the 4/6 result or standard NVFP4 per 16-element block.
+        from miles.utils.fused_nvfp4_qdq import NVFP4QDQConfig, NVFP4QDQErrorMode, compute_nvfp4_amax, fused_nvfp4_qdq
+
+        assert g == 16 and w.is_cuda and w.dtype == torch.bfloat16, "TE NVFP4 contract: CUDA bf16, 1x16 blocks"
+        x2 = w.reshape(-1, k).contiguous()
+        amax = compute_nvfp4_amax(x2)
+        std = fused_nvfp4_qdq(x2, amax, NVFP4QDQConfig())
+        f46 = fused_nvfp4_qdq(x2, amax, NVFP4QDQConfig(True, 448, NVFP4QDQErrorMode.MSE, False))
+        mask = _act46_masks()[name].to(w.device).repeat_interleave(16, dim=1)
+        return torch.where(mask, f46, std).reshape(shape).to(w.dtype)
     elif fmt in ("nvfp4te", "nvfp4te46"):
         # The miles NVFP4 RL recipe's quantizer (radixark/miles #2864, the humans& W4A16 fake-QAT recipe):
         # Transformer-Engine-exact NVFP4 (E2M1, 1x16 blocks, E4M3 block scales, FP32 per-tensor amax) via the fused
