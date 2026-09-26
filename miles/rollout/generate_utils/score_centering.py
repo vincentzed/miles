@@ -27,6 +27,9 @@ def configure_score_centering_request(args: Namespace, request: dict[str, Any], 
     elif filter_mode != "pre":  # "pre" = naive: pre-filter candidates used as if they were q (research arm)
         if openai:
             raise ValueError("Filtered score centering is only wired for native /generate")
+        # SGLang aborts sampling-mask requests without a finite top_k (scheduler.py:2787). Capping top_k at
+        # the recorded head width also guarantees support S ⊆ head, so q^F is reconstructed exactly.
+        sampling["top_k"] = k if sampling["top_k"] in (-1, 0) else min(sampling["top_k"], k)
         request["return_sampling_mask"] = True
     if openai:
         request["top_logprobs"] = k
@@ -106,9 +109,8 @@ def apply_filtered_support(sample: Sample, meta: Mapping[str, Any], n: int) -> N
         new_lp[: len(keep)] = (lq - log_z).astype(np.float32)
         ids[row], logps[row] = new_ids, new_lp
         sample.rollout_log_probs[row] = float(sample.rollout_log_probs[row] - log_z)
-    if not isinstance(sample.metadata, dict):
-        sample.metadata = {}
-    sample.metadata["sc_support_truncated"] = sample.metadata.get("sc_support_truncated", 0) + truncated
+    if truncated:
+        raise ValueError(f"{truncated} positions have sampling support outside the recorded head (top_k must be <= k)")
 
 
 def append_score_centering_observations(sample: Sample, count: int) -> None:
