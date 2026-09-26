@@ -199,6 +199,13 @@ class FSDPTrainRayActor(TrainRayActor):
         self.global_step = 0
         self.micro_step = 0
         self._drift_tracker = sc_research.DriftTracker(self.model) if args.sc_drift_diag else None
+        self._trainer_fq = (
+            sc_research.TrainerFakeQuant(
+                self.model, args.sc_trainer_weight_quant, args.sc_trainer_weight_quant_group, args.sc_quant_skip_embed
+            )
+            if args.sc_trainer_weight_quant
+            else None
+        )
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -511,7 +518,10 @@ class FSDPTrainRayActor(TrainRayActor):
             # actor forward (~30% of step time) is unused. Keep the key for downstream consumers.
             rollout_data["log_probs"] = rollout_data["rollout_log_probs"]
         else:
-            with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
+            with routing_replay.stage(routing_replay.log_prob_stage(self.args)), ExitStack() as fq:
+                if self._trainer_fq is not None:
+                    self._trainer_fq.swap_in()
+                    fq.callback(self._trainer_fq.swap_out)
                 actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
             routing_replay.rewind()
             rollout_data.update(actor_results)
@@ -529,6 +539,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
             for step_id in range(num_steps_per_rollout):
                 self.optimizer.zero_grad(set_to_none=True)
+                if self._trainer_fq is not None:
+                    self._trainer_fq.swap_in()  # QAT-RL: forward/backward at Q(theta); swapped out before the step
 
                 losses_reduced = []
                 normalizers = []
@@ -587,6 +599,8 @@ class FSDPTrainRayActor(TrainRayActor):
                         rollout_id, step_id, step_batches, num_microbatches[step_id], grad_scale, half_total
                     )
 
+                if self._trainer_fq is not None:
+                    self._trainer_fq.swap_out()  # straight-through: the gradient at Q(theta) updates theta
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                 grad_norm = grad_norm.full_tensor().item()
 

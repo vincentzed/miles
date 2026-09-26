@@ -1550,6 +1550,30 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Evaluate with clean trainer weights (no synthetic noise), re-syncing the noisy sampler after.",
             )
             parser.add_argument(
+                "--sc-trainer-weight-quant",
+                type=str,
+                default=None,
+                help="QAT-RL: trainer forward/backward through the sampler's weight fake quant (straight-through).",
+            )
+            parser.add_argument("--sc-trainer-weight-quant-group", type=int, default=0)
+            parser.add_argument(
+                "--sc-quant-skip-embed",
+                action="store_true",
+                help="Keep token embedding and LM head unquantized in all weight fake quant (standard W4A16).",
+            )
+            parser.add_argument(
+                "--sc-eval-quant",
+                type=str,
+                default=None,
+                help="fmt:group. For bf16-rollout runs, also evaluate the fake-quantized view Q(theta) at every eval point.",
+            )
+            parser.add_argument(
+                "--sc-second-eval-suffix",
+                type=str,
+                default="_sampler",
+                help="Suffix for the second eval pass per eval point (sc_ext.eval_log.log_eval).",
+            )
+            parser.add_argument(
                 "--sc-sampler-eval",
                 action="store_true",
                 help=(

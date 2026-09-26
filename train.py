@@ -199,6 +199,10 @@ async def _dispatch_eval(args, actor_model, rollout_executor, eval_dispatcher, r
     """--sc-clean-eval: evaluate on clean trainer weights, then restore the (noisy/stale) sampler."""
     if not args.sc_clean_eval:
         await eval_dispatcher.dispatch(rollout_id, **kwargs)
+        if args.sc_eval_quant:  # bf16-rollout run: also evaluate the post-hoc quantized view Q(theta), then restore
+            await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="quant")
+            await eval_dispatcher.dispatch(rollout_id, **kwargs)
+            await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="clean")
         return
     assert not args.eval_uses_snapshots, "--sc-clean-eval needs blocking shared-engine eval"
     await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="clean")

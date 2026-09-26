@@ -124,13 +124,23 @@ def _snap_float(x: torch.Tensor, fmt: str) -> torch.Tensor:
     return torch.sign(x) * torch.minimum(torch.round(ax / quantum) * quantum, torch.tensor(max_val, device=x.device))
 
 
-def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0) -> torch.Tensor:
+def q_checksum(t: torch.Tensor) -> int:
+    """Exact position-weighted checksum of a tensor's bf16 bit patterns (sampler vs. evaluated weights)."""
+    bits = t.detach().to(torch.bfloat16).contiguous().view(torch.int16).reshape(-1).to(torch.int64)
+    weights = torch.arange(bits.numel(), device=bits.device, dtype=torch.int64) % 65521 + 1
+    return int((bits * weights).sum().item())
+
+
+def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0, skip_embed: bool = False) -> torch.Tensor:
     """Weight-only quantize-dequantize, port of the paper's fake_quantize_tree (models/quant.py).
 
     Symmetric absmax scale per output row over the contraction (last) axis, optionally in groups.
-    Skips 1-D tensors, norms, biases and MoE routers. fmt: int8 | int4 | intN | fp8 | fp6 | fp4.
+    Skips 1-D tensors, norms, biases and MoE routers; with skip_embed also the token embedding and LM head
+    (standard W4A16 practice). fmt: int8 | int4 | intN | fp8 | fp6 | fp4.
     """
     if w.ndim <= 1 or "norm" in name or "bias" in name or name.endswith("mlp.gate.weight"):
+        return w
+    if skip_embed and ("embed_tokens" in name or "lm_head" in name):
         return w
     shape = w.shape
     k = shape[-1]
@@ -141,6 +151,13 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
         qmax = float(2 ** (int(fmt[3:]) - 1) - 1)
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / qmax
         q = torch.round(x / scale).clamp(-qmax, qmax)
+    elif fmt == "nvfp4":
+        # NVFP4-like: E2M1 values, per-16 block scales stored in E4M3, one fp32 per-tensor scale (amax / (6 * 448)).
+        assert g == 16, "nvfp4 uses 16-element blocks"
+        tensor_scale = x.abs().amax().clamp_min(1e-30) / (6.0 * 448.0)
+        block = (x.abs().amax(-1, keepdim=True) / 6.0 / tensor_scale).to(torch.float8_e4m3fn).float()
+        scale = (block * tensor_scale).clamp_min(1e-30)
+        q = _snap_float(x / scale, "fp4")
     else:
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / _FLOAT_GRIDS[fmt][1]
         q = _snap_float(x / scale, fmt)
@@ -165,7 +182,11 @@ class SamplerView:
         self.keep_snapshot = self.interval > 1 or getattr(args, "sc_clean_eval", False)
         self.fake_quant = getattr(args, "sc_sampler_weight_quant", None)
         self.fake_quant_group = getattr(args, "sc_sampler_weight_quant_group", 0)
-        self.enabled = bool(self.sigma) or self.keep_snapshot or bool(self.fake_quant)
+        self.skip_embed = getattr(args, "sc_quant_skip_embed", False)
+        # --sc-eval-quant fmt:group: an eval-only quantized view of the current weights (for bf16-rollout runs)
+        eval_quant = getattr(args, "sc_eval_quant", None)
+        self.eval_quant = (eval_quant.split(":")[0], int(eval_quant.split(":")[1])) if eval_quant else None
+        self.enabled = bool(self.sigma) or self.keep_snapshot or bool(self.fake_quant) or bool(getattr(args, "sc_eval_quant", None))
         tied = getattr(getattr(model, "config", None), "tie_word_embeddings", False)
         self._alias = {"lm_head.weight": "model.embed_tokens.weight"} if tied else {}
         self.deltas: dict[str, torch.Tensor] = {}
@@ -189,6 +210,9 @@ class SamplerView:
         sent_dtype = target_dtype or full.dtype
         if self.mode == "clean":
             return full.to(sent_dtype)
+        if self.mode == "quant":
+            fmt, group = self.eval_quant
+            return fake_quantize_weight(name, full.to(sent_dtype), fmt, group, self.skip_embed)
         if self.mode == "restore" or not self.refresh:
             return self.snapshot[name].to(full.device, non_blocking=True)
         out = full.to(sent_dtype)
@@ -220,7 +244,9 @@ class SamplerView:
             out = out + self.deltas[key]  # paper: bf16 weight + bf16 delta
         if self.fake_quant:
             # Re-applied on every sync, so the error tracks the current weights (paper: noise, then quant).
-            out = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group)
+            out = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group, self.skip_embed)
+            if self.mode == "normal" and self.refresh and name != "lm_head.weight":  # tied head counted once
+                self._stats["q_checksum"] = self._stats.get("q_checksum", 0) + q_checksum(out)
         if self.keep_snapshot:
             self.snapshot[name] = out.detach().to("cpu", copy=True)
         return out
@@ -236,7 +262,38 @@ class SamplerView:
                 delta_norm=s["delta_sq"] ** 0.5,
                 sham_proj=[s.get(f"sham_proj{j}", 0.0) / max(s.get(f"sham_sq{j}", 0.0), 1e-30) for j in range(self.n_sham)],
             )
+        if "q_checksum" in self._stats:
+            record["q_checksum"] = self._stats["q_checksum"]
         append_diag(self.args, record)
+
+
+class TrainerFakeQuant:
+    """QAT-RL: the trainer's forward/backward see Q(bf16(theta)) (same function as the sampler), the optimizer
+    updates the fp32 master theta (straight-through estimator). With the sampler also at Q, training is on-policy.
+
+    Swaps each local shard in place: FSDP2 shards dim 0, and fake quant groups run along the last dim within a
+    row, so quantizing a local shard equals quantizing the full tensor."""
+
+    def __init__(self, model: torch.nn.Module, fmt: str, group: int, skip_embed: bool):
+        self.params = [(n, p) for n, p in model.named_parameters()]
+        self.fmt, self.group, self.skip_embed = fmt, group, skip_embed
+        self.saved: list[torch.Tensor] | None = None
+
+    @torch.no_grad()
+    def swap_in(self) -> None:
+        assert self.saved is None, "TrainerFakeQuant.swap_in called twice"
+        self.saved = []
+        for name, p in self.params:
+            local = _local(p)
+            self.saved.append(local.detach().clone())
+            local.copy_(fake_quantize_weight(name, local.to(torch.bfloat16), self.fmt, self.group, self.skip_embed))
+
+    @torch.no_grad()
+    def swap_out(self) -> None:
+        assert self.saved is not None, "TrainerFakeQuant.swap_out without swap_in"
+        for (_, p), orig in zip(self.params, self.saved, strict=True):
+            _local(p).copy_(orig)
+        self.saved = None
 
 
 class DriftTracker:
