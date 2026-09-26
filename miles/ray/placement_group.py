@@ -159,8 +159,8 @@ async def create_training_models(args, inference_controller, rollout_executor):
     return actor_model, critic_model
 
 
-async def update_weights(actor_model, rollout_executor, *, rollout_id: int | None = None) -> None:
-    if (weight_version := await actor_model.update_weights(rollout_id=rollout_id)) is not None:
+async def update_weights(actor_model, rollout_executor, *, rollout_id: int | None = None, sc_mode: str = "normal") -> None:
+    if (weight_version := await actor_model.update_weights(rollout_id=rollout_id, sc_mode=sc_mode)) is not None:
         await rollout_executor.set_weight_version.remote(weight_version)
 
 

@@ -103,9 +103,9 @@ async def train(args):
     if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
         await inference_controller.prepare_eval()
         if args.start_rollout_id == 0:
-            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+            await _dispatch_eval(args, actor_model, rollout_executor, eval_dispatcher, 0, hf_dir=args.hf_checkpoint)
         else:
-            await eval_dispatcher.dispatch(args.start_rollout_id - 1)
+            await _dispatch_eval(args, actor_model, rollout_executor, eval_dispatcher, args.start_rollout_id - 1)
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -172,7 +172,9 @@ async def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout):
             await inference_controller.prepare_eval()
-            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+            await _dispatch_eval(
+                args, actor_model, rollout_executor, eval_dispatcher, rollout_id, force=rollout_id == args.num_rollout - 1
+            )
 
         if (
             args.debug_exit_after_rollout is not None
@@ -191,6 +193,19 @@ async def train(args):
     await actor_model.dispose()
     if critic_model is not None:
         await critic_model.dispose()
+
+
+async def _dispatch_eval(args, actor_model, rollout_executor, eval_dispatcher, rollout_id, **kwargs):
+    """--sc-clean-eval: evaluate on clean trainer weights, then restore the (noisy/stale) sampler."""
+    if not args.sc_clean_eval:
+        await eval_dispatcher.dispatch(rollout_id, **kwargs)
+        return
+    assert not args.eval_uses_snapshots, "--sc-clean-eval needs blocking shared-engine eval"
+    await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="clean")
+    await eval_dispatcher.dispatch(rollout_id, **kwargs)
+    await update_weights(actor_model, rollout_executor, rollout_id=rollout_id, sc_mode="restore")
+    if args.sc_sampler_eval:
+        await eval_dispatcher.dispatch(rollout_id, **kwargs)
 
 
 if __name__ == "__main__":

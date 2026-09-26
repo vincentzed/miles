@@ -646,7 +646,7 @@ class FSDPTrainRayActor(TrainRayActor):
         return log_dict, normalizer
 
     @timer
-    def update_weights(self, info: "UpdatableEngines") -> int | None:  # type: ignore[override]
+    def update_weights(self, info: "UpdatableEngines", sc_mode: str = "normal") -> int | None:  # type: ignore[override]
         """Synchronize actor weights to rollout engines (colocated or distributed; wakes params in offload mode)."""
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return None
@@ -667,7 +667,7 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater.conn_status.mark_reconnected(snapshot_cell_id_to_hashes)
             dist.barrier(group=get_gloo_group())
 
-        self.weight_updater.update_weights()
+        self.weight_updater.update_weights(sc_mode=sc_mode)
 
         if self.args.ci_test and len(rollout_engines) > 0:
             engine = random.choice(rollout_engines)

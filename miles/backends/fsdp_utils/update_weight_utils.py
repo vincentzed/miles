@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from .adaptations.weight_bridge import get_param_transform
 from .dtensor import gather_full_param
+from .sc_research import SamplerView
 
 
 def _iter_sync_named_params(name, param, model_type, model, sync_dtypes=None):
@@ -65,6 +66,7 @@ class UpdateWeight(abc.ABC):
         self.model = model
         self.weight_version = 0
         self.conn_status = ConnStatusManager()
+        self.sampler_view = SamplerView(args, model)
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -75,8 +77,9 @@ class UpdateWeight(abc.ABC):
     ) -> None:
         pass
 
-    def update_weights(self) -> None:
+    def update_weights(self, sc_mode: str = "normal") -> None:
         self.weight_version += 1
+        self.sampler_view.begin(sc_mode)
 
         if dist.get_rank() == 0:
             async_utils.wait_futures(
@@ -122,13 +125,18 @@ class UpdateWeight(abc.ABC):
                 [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
+        if self.sampler_view.enabled:
+            self.sampler_view.end(self.weight_version)
 
     def wait_and_update_bucket_weights(self, bucket):
         resolved = []
         for name, param, target_dtype in bucket:
             if hasattr(param, "wait"):
                 param = param.wait()
-            if target_dtype is not None and param.dtype != target_dtype:
+            if self.sampler_view.enabled:
+                # Pre-cast master weights feed the noise/staleness view and its diagnostics.
+                param = self.sampler_view.transform(name, param, target_dtype)
+            elif target_dtype is not None and param.dtype != target_dtype:
                 param = param.to(target_dtype)
             resolved.append((name, param))
         self.update_bucket_weights(resolved, weight_version=self.weight_version)

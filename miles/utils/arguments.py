@@ -1497,10 +1497,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 choices=["none", "plus_one", "minus_one", "random_sign"],
                 default="none",
             )
+            parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
             parser.add_argument(
                 "--sc-zero-token-mean-adv",
                 action="store_true",
                 help="Shift advantages so the token-weighted mean advantage is 0 (removes the length-bias drift coefficient).",
+            )
+            parser.add_argument(
+                "--sc-noise-redraw",
+                action="store_true",
+                help="Draw a fresh weight-noise Delta at every sampler refresh (control for the fixed-bias feedback loop).",
             )
             parser.add_argument("--sc-rollout-min-p", type=float, default=0.0, help="min_p for training rollouts.")
             parser.add_argument(
@@ -1519,11 +1525,47 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="Multiply the centering term by lambda (causal control; 2 = equal-size drift, opposite sign).",
             )
             parser.add_argument(
+                "--sc-sampler-weight-quant",
+                type=str,
+                default=None,
+                help="Weight-only fake quant of the synced sampler weights: int8|int4|intN|fp8|fp6|fp4 (paper quant.py).",
+            )
+            parser.add_argument("--sc-sampler-weight-quant-group", type=int, default=0)
+            parser.add_argument(
                 "--sc-skip-old-logprob",
                 action="store_true",
                 help="Skip the pre-update actor log-prob pass (unused by the score-centering loss).",
             )
             parser.add_argument("--sc-advantage-shift", type=float, default=0.0, help="Add a constant to advantages.")
+            parser.add_argument(
+                "--sc-stale-interval",
+                type=int,
+                default=1,
+                help="Refresh the sampler every N steps (paper staleness s -> N = s + 1); FSDP colocated only.",
+            )
+            parser.add_argument(
+                "--sc-clean-eval",
+                action="store_true",
+                help="Evaluate with clean trainer weights (no synthetic noise), re-syncing the noisy sampler after.",
+            )
+            parser.add_argument(
+                "--sc-sampler-eval",
+                action="store_true",
+                help=(
+                    "With --sc-clean-eval, also evaluate the deployed (noisy/stale) sampler policy after restoring it. "
+                    "The second pass is logged as eval/<name>_sampler by sc_ext.eval_log.log_eval "
+                    "(--custom-eval-rollout-log-function-path)."
+                ),
+            )
+            parser.add_argument(
+                "--sc-weight-noise",
+                type=float,
+                default=0.0,
+                help=(
+                    "Research knob: add a fixed relative Gaussian offset sigma * eps * theta_0 to the weights "
+                    "sent to the rollout engine (synthetic training-inference mismatch). FSDP colocated only."
+                ),
+            )
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
