@@ -1500,6 +1500,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
             parser.add_argument(
+                "--sc-zero-token-mean-adv",
+                action="store_true",
+                help="Shift advantages so the token-weighted mean advantage is 0 (removes the length-bias drift coefficient).",
+            )
+            parser.add_argument(
                 "--sc-noise-redraw",
                 action="store_true",
                 help="Draw a fresh weight-noise Delta at every sampler refresh (control for the fixed-bias feedback loop).",

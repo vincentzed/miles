@@ -73,6 +73,13 @@ def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: in
     zero (E_p[score] = 0), so any systematic motion is drift toward/away from the sampler.
     random_sign: one independent +-1 per sequence (seeded by rollout id); E[A | prefix] = 0.
     """
+    if getattr(args, "sc_zero_token_mean_adv", False):
+        # Remove the drift coefficient of the token-mean loss: subtract sum_i A_i L_i / sum_i L_i from every
+        # token's advantage (per optimizer batch), keeping the within-batch covariance (the signal) intact.
+        lens = [float(len(a)) for a in rollout_data["advantages"]]
+        num = sum(float(a[0]) * l for a, l in zip(rollout_data["advantages"], lens) if len(a))
+        c = num / max(sum(lens), 1.0)
+        rollout_data["advantages"] = [a - c for a in rollout_data["advantages"]]
     shift = getattr(args, "sc_advantage_shift", 0.0)
     if shift:
         # Dose knob for drift: A + c keeps the signal (covariance) and adds c * s-bar of drift.
