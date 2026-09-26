@@ -18,6 +18,9 @@ def importance_weights(
     tis_clip: float = 2.0,
     mis_low: float = 0.5,
     mis_high: float = 5.0,
+    positive: torch.Tensor | None = None,
+    ppo_low: float = 0.8,
+    ppo_high: float = 1.2,
 ) -> torch.Tensor:
     """Evaluate token-level weights without exponentiating unbounded ratios."""
     if mode == "none":
@@ -27,7 +30,27 @@ def importance_weights(
     if mode == "mis":
         inside = (log_ratio >= math.log(mis_low)) & (log_ratio <= math.log(mis_high))
         return torch.where(inside, log_ratio.clamp(max=math.log(mis_high)).exp(), 0.0)
+    if mode == "ppo":
+        inside = ppo_in_band(log_ratio, positive, low=ppo_low, high=ppo_high)
+        return torch.where(inside, log_ratio.clamp(max=math.log(PPO_DUAL_CLIP)).exp(), 0.0)
     raise ValueError(f"Unknown score-centering importance weighting: {mode}")
+
+
+PPO_DUAL_CLIP = 3.0
+
+
+def ppo_in_band(log_ratio: torch.Tensor, positive: torch.Tensor, *, low: float, high: float) -> torch.Tensor:
+    """PPO's pessimistic clip as a detached REINFORCE weight (paper code, losses.py:151-160).
+
+    Gradient-identical to the clipped surrogate: A >= 0 keeps r <= high, A < 0 keeps
+    low <= r <= 3 (dual clip); outside the band the token is dropped. The band depends on
+    sign(A), so centering is done conditionally on the sign (losses.py:192-196).
+    """
+    if positive.dim() < log_ratio.dim():
+        positive = positive.unsqueeze(-1)
+    upper = torch.where(positive, math.log(high), math.log(PPO_DUAL_CLIP))
+    lower = torch.where(positive, -math.inf, math.log(low))
+    return (log_ratio <= upper) & (log_ratio >= lower)
 
 
 def score_centering_loss(
@@ -44,6 +67,10 @@ def score_centering_loss(
     mis_high: float = 5.0,
     eps: float = 1e-6,
     center: bool = True,
+    center_only: bool = False,
+    ppo_low: float = 0.8,
+    ppo_high: float = 1.2,
+    q_tail_floor: float | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return unreduced token losses and detached token metrics.
 
@@ -57,7 +84,10 @@ def score_centering_loss(
         p = head_log_probs.exp().masked_fill(~head_mask, 0.0)
         q = rollout_head_log_probs.exp().masked_fill(~head_mask, 0.0)
         p_mass, q_mass = p.sum(-1), q.sum(-1)
-        rho = (1 - q_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
+        # The paper's appendix snippet floors the sampler tail at eps; its training code floors at 0.
+        q_floor = eps if q_tail_floor is None else q_tail_floor
+        rho = (1 - q_mass).clamp_min(q_floor) / (1 - p_mass).clamp_min(eps)
+        positive = advantages.detach() >= 0
         if mode == "none":
             weighted_q, alpha = q, rho
         elif mode == "tis":
@@ -68,6 +98,13 @@ def score_centering_loss(
             inside = (log_ratio >= math.log(mis_low)) & (log_ratio <= math.log(mis_high))
             weighted_q = torch.where(inside & head_mask, p, 0.0)
             alpha = ((rho >= 1 / mis_high) & (rho <= 1 / mis_low)).to(p.dtype)
+        elif mode == "ppo":
+            # In band the effective mass q * (p/q) is p; out of band it is 0. The modeled tail has
+            # constant ratio 1/rho, so alpha = rho * w(1/rho) = 1{1/rho in band}.
+            inside = ppo_in_band(head_log_probs - rollout_head_log_probs, positive, low=ppo_low, high=ppo_high)
+            weighted_q = torch.where(inside & head_mask, p, 0.0)
+            tail_log_ratio = -rho.clamp_min(1e-30).log()
+            alpha = ppo_in_band(tail_log_ratio, positive, low=ppo_low, high=ppo_high).to(p.dtype)
         else:
             raise ValueError(f"Unknown score-centering importance weighting: {mode}")
         residual = weighted_q - alpha.unsqueeze(-1) * p
@@ -77,10 +114,16 @@ def score_centering_loss(
             tis_clip=tis_clip,
             mis_low=mis_low,
             mis_high=mis_high,
+            positive=positive,
+            ppo_low=ppo_low,
+            ppo_high=ppo_high,
         )
-    correction = (residual * head_log_probs).sum(-1)
+    correction =(residual * head_log_probs).sum(-1)
     applied_correction = correction if center else correction * 0.0
     loss = -advantages.detach() * (weight * train_log_probs - applied_correction)
+    if center_only:
+        # Research diagnostic: gradient of the centering term alone (G_c), independent of `center`.
+        loss = advantages.detach() * correction
     return loss, {
         "sc_correction": applied_correction.detach(),
         "sc_uncentered_correction": correction.detach(),

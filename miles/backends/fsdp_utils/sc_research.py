@@ -1,0 +1,190 @@
+"""Research instrumentation for score-centering studies (arXiv:2609.20807).
+
+Everything here is opt-in and inert unless the matching `--sc-*` flag is set:
+- paper loss normalization: sum over tokens / total tokens of the optimizer batch;
+- placebo advantages (constant or content-independent), for causal drift tests;
+- drift decomposition: one extra backward of the centering term per optimizer step, giving the
+  gradient split G_pg = G_sc - G_c and running sums / cross-step inner products;
+- a jsonl sink shared with the weight-sync hook (weight-noise projection diagnostics).
+"""
+
+import json
+import os
+import zlib
+from argparse import Namespace
+
+import torch
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor
+
+
+def append_diag(args: Namespace, record: dict) -> None:
+    path = getattr(args, "sc_diag_path", None)
+    if not path or dist.get_rank() != 0:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+    return t.to_local() if isinstance(t, DTensor) else t
+
+
+def grads_of(model: torch.nn.Module) -> list[torch.Tensor]:
+    return [_local(p.grad) if p.grad is not None else None for p in model.parameters()]
+
+
+def scale_grads(model: torch.nn.Module, factor: float) -> None:
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.mul_(factor)
+
+
+def token_count_all_reduce(count: torch.Tensor) -> float:
+    count = count.detach().float().clone()
+    if dist.is_initialized():
+        dist.all_reduce(count)
+    return max(count.item(), 1.0)
+
+
+def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: int) -> None:
+    """Replace advantages by a content-independent placebo.
+
+    plus_one / minus_one: A = +-1 for every token (uncentered). On-policy the expected update is
+    zero (E_p[score] = 0), so any systematic motion is drift toward/away from the sampler.
+    random_sign: one independent +-1 per sequence (seeded by rollout id); E[A | prefix] = 0.
+    """
+    mode = getattr(args, "sc_placebo_advantage", "none")
+    if mode == "none":
+        return
+    advantages = rollout_data["advantages"]
+    if mode == "random_sign":
+        generator = torch.Generator().manual_seed(args.seed * 7919 + rollout_id)
+        signs = torch.randint(0, 2, (len(advantages),), generator=generator) * 2 - 1
+    else:
+        signs = torch.full((len(advantages),), 1 if mode == "plus_one" else -1)
+    rollout_data["advantages"] = [torch.full_like(a, float(s)) for a, s in zip(advantages, signs.tolist())]
+
+
+class SamplerView:
+    """What the rollout engine receives on each weight sync (research knobs, all opt-in).
+
+    mode "normal": on a refresh step send theta_t + Delta (Delta = sigma * eps * theta_0, drawn once
+    from the initial sync, seeded by --sc-weight-noise-seed) and snapshot it; between refreshes
+    (--sc-stale-interval N: refresh every N syncs, the paper's staleness s gives N = s + 1) resend the
+    snapshot, so the sampler is exactly N-stale as in the paper (colocated SGLang drops its weights on
+    offload, so skipping the sync is not an option). mode "clean": send theta_t (clean eval).
+    mode "restore": resend the snapshot after a clean eval.
+    """
+
+    def __init__(self, args: Namespace, model: torch.nn.Module):
+        self.args = args
+        self.sigma = getattr(args, "sc_weight_noise", 0.0)
+        self.interval = max(1, getattr(args, "sc_stale_interval", 1))
+        self.keep_snapshot = self.interval > 1 or getattr(args, "sc_clean_eval", False)
+        self.enabled = bool(self.sigma) or self.keep_snapshot
+        tied = getattr(getattr(model, "config", None), "tie_word_embeddings", False)
+        self._alias = {"lm_head.weight": "model.embed_tokens.weight"} if tied else {}
+        self.deltas: dict[str, torch.Tensor] = {}
+        self.theta0: dict[str, torch.Tensor] = {}
+        self.snapshot: dict[str, torch.Tensor] = {}
+        self.normal_syncs = 0
+        self.mode = "normal"
+        self.refresh = True
+        self._stats: dict[str, float] = {}
+
+    def begin(self, mode: str) -> None:
+        self.mode = mode
+        if mode == "normal":
+            self.normal_syncs += 1
+            self.refresh = (self.normal_syncs - 1) % self.interval == 0
+        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0}
+
+    def transform(self, name: str, full: torch.Tensor, target_dtype: torch.dtype | None) -> torch.Tensor:
+        sent_dtype = target_dtype or full.dtype
+        if self.mode == "clean":
+            return full.to(sent_dtype)
+        if self.mode == "restore" or not self.refresh:
+            return self.snapshot[name].to(full.device, non_blocking=True)
+        out = full.to(sent_dtype)
+        if self.sigma:
+            key = self._alias.get(name, name)
+            if key not in self.deltas:
+                seed = (self.args.sc_weight_noise_seed * 1_000_003 + zlib.crc32(key.encode())) % 2**63
+                generator = torch.Generator(device=full.device).manual_seed(seed)
+                eps = torch.randn(full.shape, generator=generator, device=full.device, dtype=torch.float32)
+                self.deltas[key] = (self.sigma * eps * full.float()).to(sent_dtype)
+                self.theta0[key] = full.detach().float().clone()
+            if key == name:  # count tied weights once
+                delta = self.deltas[key].float()
+                disp = full.float() - self.theta0[key]
+                self._stats["proj"] += (disp * delta).sum().item()
+                self._stats["disp_sq"] += disp.square().sum().item()
+                self._stats["delta_sq"] += delta.square().sum().item()
+            out = out + self.deltas[key]  # paper: bf16 weight + bf16 delta
+        if self.keep_snapshot:
+            self.snapshot[name] = out.detach().to("cpu", copy=True)
+        return out
+
+    def end(self, weight_version: int) -> None:
+        record = {"kind": "sync", "mode": self.mode, "weight_version": weight_version, "refresh": self.refresh}
+        if self.sigma and self.mode == "normal" and self.refresh:
+            s = self._stats
+            record.update(
+                delta_proj=s["proj"] / max(s["delta_sq"], 1e-30),
+                delta_cos=s["proj"] / max((s["disp_sq"] * s["delta_sq"]) ** 0.5, 1e-30),
+                disp_norm=s["disp_sq"] ** 0.5,
+                delta_norm=s["delta_sq"] ** 0.5,
+            )
+        append_diag(self.args, record)
+
+
+class DriftTracker:
+    """Split each step's gradient into the centering component G_c and the rest.
+
+    With the score-centering loss L = -A (w log p - c), G_total = G_pg + G_c where G_c = grad(A c).
+    For a PG arm (centering disabled) the applied gradient is G_pg; for an SC arm it is G_pg + G_c.
+    Under SGD, theta_T - theta_0 = -lr * sum_t G_t exactly, so the running sums of G_c and G_pg
+    give the accumulated drift vs signal displacement. Cross-step inner products use independent
+    batches, so <G_t, G_{t-1}> is unbiased for <E G_t, E G_{t-1}> (persistence without noise bias).
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        params = [_local(p) for p in model.parameters()]
+        self.sum_c = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+        self.sum_pg = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+        self.prev_c = None
+        self.prev_pg = None
+        self.steps = 0
+
+    @staticmethod
+    def _dot(a: list[torch.Tensor], b: list[torch.Tensor]) -> float:
+        total = torch.zeros((), device=a[0].device, dtype=torch.float64)
+        for x, y in zip(a, b, strict=True):
+            total += (x.double() * y.double()).sum()
+        if dist.is_initialized():
+            dist.all_reduce(total)
+        return total.item()
+
+    def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], centered: bool) -> dict:
+        g_c = [g.float() for g in g_c]
+        g_pg = [t.float() - c if centered else t.float() for t, c in zip(g_total, g_c, strict=True)]
+        record = {
+            "g_c_sq": self._dot(g_c, g_c),
+            "g_pg_sq": self._dot(g_pg, g_pg),
+            "g_c_dot_g_pg": self._dot(g_c, g_pg),
+        }
+        if self.prev_c is not None:
+            record["g_c_cross_step"] = self._dot(g_c, self.prev_c)
+            record["g_pg_cross_step"] = self._dot(g_pg, self.prev_pg)
+        for s, g in zip(self.sum_c, g_c, strict=True):
+            s.add_(g)
+        for s, g in zip(self.sum_pg, g_pg, strict=True):
+            s.add_(g)
+        self.steps += 1
+        record["sum_c_sq"] = self._dot(self.sum_c, self.sum_c)
+        record["sum_pg_sq"] = self._dot(self.sum_pg, self.sum_pg)
+        record["sum_c_dot_sum_pg"] = self._dot(self.sum_c, self.sum_pg)
+        self.prev_c, self.prev_pg = g_c, g_pg
+        return record

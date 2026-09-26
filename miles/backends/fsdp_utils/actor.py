@@ -35,7 +35,7 @@ from miles.utils.ray_utils import Box
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils.tracking import init_tracking
 
-from . import checkpoint
+from . import checkpoint, sc_research
 from .adaptations.class_patches import apply_class_patches, apply_model_instance_patches
 from .adaptations.packing import apply_packing
 from .adaptations.post_load_fixups import apply_post_load_fixups
@@ -197,6 +197,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.global_step = 0
         self.micro_step = 0
+        self._drift_tracker = sc_research.DriftTracker(self.model) if args.sc_drift_diag else None
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -502,6 +503,7 @@ class FSDPTrainRayActor(TrainRayActor):
         rollout_data.update(actor_results)
 
         compute_advantages_and_returns(self.args, rollout_data)
+        sc_research.apply_placebo_advantages(self.args, rollout_data, rollout_id)
 
         log_rollout_data(rollout_id, self.args, rollout_data)
 
@@ -513,6 +515,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 losses_reduced = []
+                normalizers = []
+                step_batches = []
                 for _ in self.prof.iterate_train_actor(
                     tqdm(range(num_microbatches[step_id]), desc="actor_train", disable=dist.get_rank() != 0)
                 ):
@@ -538,12 +542,24 @@ class FSDPTrainRayActor(TrainRayActor):
                         get_position_ids=True,
                     )
 
-                    log_dict = self._train_step(
+                    log_dict, normalizer = self._train_step(
                         batch=batch,
                         step_id=step_id,
                         num_microbatches=num_microbatches[step_id],
                     )
                     losses_reduced.append(log_dict)
+                    normalizers.append(normalizer)
+                    if self._drift_tracker is not None:
+                        step_batches.append(batch)
+
+                total_tokens = 1.0
+                if self.args.sc_token_mean_loss:
+                    assert self.args.calculate_per_token_loss, "--sc-token-mean-loss needs --calculate-per-token-loss"
+                    # Paper normalization: sum over the optimizer batch's tokens / total tokens.
+                    total_tokens = sc_research.token_count_all_reduce(torch.stack(normalizers).sum())
+                    sc_research.scale_grads(self.model, 1.0 / total_tokens)
+                if self._drift_tracker is not None:
+                    self._observe_drift(rollout_id, step_id, step_batches, num_microbatches[step_id], total_tokens)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                 grad_norm = grad_norm.full_tensor().item()
@@ -612,10 +628,30 @@ class FSDPTrainRayActor(TrainRayActor):
 
         loss.backward()
 
-        return log_dict
+        return log_dict, normalizer
+
+    def _observe_drift(self, rollout_id, step_id, step_batches, num_microbatches, total_tokens) -> None:
+        """Extra backward of the centering term only; leaves the step's gradient untouched."""
+        g_total = [g.clone() for g in sc_research.grads_of(self.model)]
+        self.optimizer.zero_grad(set_to_none=True)
+        self.args.sc_center_only = True
+        try:
+            for batch in step_batches:
+                self._train_step(batch=batch, step_id=step_id, num_microbatches=num_microbatches)
+        finally:
+            self.args.sc_center_only = False
+        sc_research.scale_grads(self.model, 1.0 / total_tokens)
+        g_c = sc_research.grads_of(self.model)
+        centered = not self.args.disable_score_centering_correction
+        record = self._drift_tracker.observe(g_total, g_c, centered=centered)
+        record.update(kind="drift", rollout_id=rollout_id, step_id=step_id, lr=self.args.lr)
+        sc_research.append_diag(self.args, record)
+        for p, g in zip(self.model.parameters(), g_total, strict=True):
+            if p.grad is not None:
+                sc_research._local(p.grad).copy_(g)
 
     @timer
-    def update_weights(self, info: "UpdatableEngines") -> int | None:  # type: ignore[override]
+    def update_weights(self, info: "UpdatableEngines", sc_mode: str = "normal") -> int | None:  # type: ignore[override]
         """Synchronize actor weights to rollout engines (colocated or distributed; wakes params in offload mode)."""
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return None
@@ -636,7 +672,7 @@ class FSDPTrainRayActor(TrainRayActor):
             self.weight_updater.conn_status.mark_reconnected(snapshot_cell_id_to_hashes)
             dist.barrier(group=get_gloo_group())
 
-        self.weight_updater.update_weights()
+        self.weight_updater.update_weights(sc_mode=sc_mode)
 
         if self.args.ci_test and len(rollout_engines) > 0:
             engine = random.choice(rollout_engines)

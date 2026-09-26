@@ -1,7 +1,6 @@
 import abc
 import logging
 import socket
-import zlib
 from argparse import Namespace
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -39,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 from .adaptations.weight_bridge import get_param_transform
 from .dtensor import gather_full_param
+from .sc_research import SamplerView
 
 
 def _iter_sync_named_params(name, param, model_type, model, sync_dtypes=None):
@@ -66,6 +66,7 @@ class UpdateWeight(abc.ABC):
         self.model = model
         self.weight_version = 0
         self.conn_status = ConnStatusManager()
+        self.sampler_view = SamplerView(args, model)
 
     @abc.abstractmethod
     def connect_rollout_engines(
@@ -76,8 +77,9 @@ class UpdateWeight(abc.ABC):
     ) -> None:
         pass
 
-    def update_weights(self) -> None:
+    def update_weights(self, sc_mode: str = "normal") -> None:
         self.weight_version += 1
+        self.sampler_view.begin(sc_mode)
 
         if dist.get_rank() == 0:
             async_utils.wait_futures(
@@ -123,33 +125,21 @@ class UpdateWeight(abc.ABC):
                 [async_utils.submit(client.continue_generation()) for client in self.rollout_engines]
             )
         dist.barrier(group=get_gloo_group())
+        if self.sampler_view.enabled:
+            self.sampler_view.end(self.weight_version)
 
     def wait_and_update_bucket_weights(self, bucket):
         resolved = []
         for name, param, target_dtype in bucket:
             if hasattr(param, "wait"):
                 param = param.wait()
-            if target_dtype is not None and param.dtype != target_dtype:
+            if self.sampler_view.enabled:
+                # Pre-cast master weights feed the noise/staleness view and its diagnostics.
+                param = self.sampler_view.transform(name, param, target_dtype)
+            elif target_dtype is not None and param.dtype != target_dtype:
                 param = param.to(target_dtype)
-            resolved.append((name, self._maybe_add_weight_noise(name, param)))
+            resolved.append((name, param))
         self.update_bucket_weights(resolved, weight_version=self.weight_version)
-
-    def _maybe_add_weight_noise(self, name: str, param: torch.Tensor) -> torch.Tensor:
-        """Synthetic training-inference mismatch (arXiv:2609.20807, Sec. 5.2).
-
-        The sampler receives theta + delta, where delta = sigma * eps * theta_0 is drawn once from
-        the weights of the first sync (the initial checkpoint) and held fixed for the whole run.
-        """
-        sigma = getattr(self.args, "sc_weight_noise", 0.0)
-        if not sigma:
-            return param
-        deltas = self.__dict__.setdefault("_weight_noise_deltas", {})
-        if name not in deltas:
-            seed = (self.args.seed * 1_000_003 + zlib.crc32(name.encode())) % 2**63
-            generator = torch.Generator(device=param.device).manual_seed(seed)
-            eps = torch.randn(param.shape, generator=generator, device=param.device, dtype=torch.float32)
-            deltas[name] = (sigma * eps * param.float()).to(param.dtype)
-        return param + deltas[name]
 
     @abc.abstractmethod
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:

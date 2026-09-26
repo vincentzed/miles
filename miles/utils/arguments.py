@@ -1469,7 +1469,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--score-centering-is",
-                choices=["none", "tis", "mis"],
+                choices=["none", "tis", "mis", "ppo"],
                 default="none",
                 help="Importance weights to center together with the policy score.",
             )
@@ -1477,6 +1477,38 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "--disable-score-centering-correction",
                 action="store_true",
                 help="Ablate only score centering while retaining identical importance weights and diagnostics.",
+            )
+            parser.add_argument("--score-centering-ppo-low", type=float, default=0.8)
+            parser.add_argument("--score-centering-ppo-high", type=float, default=1.2)
+            parser.add_argument(
+                "--sc-q-tail-floor",
+                type=float,
+                default=None,
+                help="Floor for the sampler tail mass in rho (default eps=1e-6; the paper's training code uses 0).",
+            )
+            parser.add_argument(
+                "--sc-token-mean-loss",
+                action="store_true",
+                help="Paper normalization: divide the summed token loss by the optimizer batch's token count (FSDP).",
+            )
+            parser.add_argument("--sc-drift-diag", action="store_true", help="Extra backward of the centering term.")
+            parser.add_argument("--sc-diag-path", type=str, default=None, help="jsonl sink for sc research diagnostics.")
+            parser.add_argument(
+                "--sc-placebo-advantage",
+                choices=["none", "plus_one", "minus_one", "random_sign"],
+                default="none",
+            )
+            parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
+            parser.add_argument(
+                "--sc-stale-interval",
+                type=int,
+                default=1,
+                help="Refresh the sampler every N steps (paper staleness s -> N = s + 1); FSDP colocated only.",
+            )
+            parser.add_argument(
+                "--sc-clean-eval",
+                action="store_true",
+                help="Evaluate with clean trainer weights (no synthetic noise), re-syncing the noisy sampler after.",
             )
             parser.add_argument(
                 "--sc-weight-noise",

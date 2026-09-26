@@ -334,7 +334,7 @@ class TrainerController:
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
 
-    async def update_weights(self, rollout_id: int | None = None) -> int | None:
+    async def update_weights(self, rollout_id: int | None = None, sc_mode: str = "normal") -> int | None:
         """Broadcast weights to rollout engines and answer the version they now serve."""
         log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
         # TODO: allow using all cells to update weights (instead of first alive cell)
@@ -343,7 +343,9 @@ class TrainerController:
         info = await self._inference_controller.start_update_weights()
         # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
         weight_versions = await retry(
-            lambda _: self._execute_first_alive("update_weights", info=info),
+            lambda _: self._execute_first_alive(
+                "update_weights", info=info, **({} if sc_mode == "normal" else {"sc_mode": sc_mode})
+            ),
             max_attempts=_RETRY_MAX_ATTEMPTS,
         )
         await self._inference_controller.end_update_weights(snapshot_cell_id_to_hashes=info.snapshot_cell_id_to_hashes)
