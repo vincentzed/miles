@@ -133,7 +133,7 @@ def score_centering_loss(
             ppo_low=ppo_low,
             ppo_high=ppo_high,
         )
-    correction =(residual * head_log_probs).sum(-1)
+    correction = (residual * head_log_probs).sum(-1)
     # center_scale (lambda) is a causal control: 0 = PG, 1 = SC, 2 = same-size drift of opposite sign.
     applied_correction = correction * center_scale if center else correction * 0.0
     loss = -advantages.detach() * (weight * train_log_probs - applied_correction)
