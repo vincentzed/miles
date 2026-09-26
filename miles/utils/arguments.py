@@ -1499,6 +1499,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default="none",
             )
             parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
+            parser.add_argument("--sc-rollout-min-p", type=float, default=0.0, help="min_p for training rollouts.")
+            parser.add_argument(
+                "--sc-filter-mode",
+                choices=["none", "pre", "post", "post_renorm"],
+                default="none",
+                help=(
+                    "Filtered sampling (top-p/top-k/min-p) research arms: pre = naive pre-filter candidates as q; "
+                    "post = post-filter q^F from SGLang's sampling mask; post_renorm = post + trainer renormalized over S."
+                ),
+            )
             parser.add_argument(
                 "--sc-center-scale",
                 type=float,

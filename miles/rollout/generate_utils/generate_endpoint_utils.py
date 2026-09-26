@@ -8,7 +8,11 @@ from typing import Any
 import numpy as np
 import pybase64
 
-from miles.rollout.generate_utils.score_centering import append_score_centering_topk, configure_score_centering_request
+from miles.rollout.generate_utils.score_centering import (
+    append_score_centering_topk,
+    apply_filtered_support,
+    configure_score_centering_request,
+)
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
 from miles.utils.score_centering import score_centering_top_k
@@ -106,6 +110,8 @@ async def update_sample_from_response(
     sample.rollout_log_probs += new_response_log_probs
     if payload.get("top_logprobs_num"):
         append_score_centering_topk(sample, output["meta_info"], score_centering_top_k(args))
+        if payload.get("return_sampling_mask"):
+            apply_filtered_support(sample, output["meta_info"], len(new_response_tokens))
 
     if update_loss_mask:
         if sample.loss_mask is None:

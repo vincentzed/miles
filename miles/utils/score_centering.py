@@ -47,9 +47,10 @@ def validate_score_centering_args(args: Namespace) -> None:
     low, high = args.score_centering_mis_low, args.score_centering_mis_high
     if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
         raise ValueError("Score-centering MIS bounds must be finite with 0 < low <= high")
-    validate_score_centering_sampling(
-        {"top_p": args.rollout_top_p, "top_k": args.rollout_top_k}, temperature=args.rollout_temperature
-    )
+    if getattr(args, "sc_filter_mode", "none") == "none":
+        validate_score_centering_sampling(
+            {"top_p": args.rollout_top_p, "top_k": args.rollout_top_k}, temperature=args.rollout_temperature
+        )
     if args.advantage_estimator != "grpo":
         raise ValueError("Score centering currently supports --advantage-estimator grpo (group-centered rewards)")
     incompatible = {
