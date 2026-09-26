@@ -239,6 +239,24 @@ class DriftTracker:
             dist.all_reduce(total)
         return total.item()
 
+    def split_half(self, g_total, half_total, g_c, half_c, grad_scale, center_scale) -> dict:
+        """Cross-half products (x4 to undo the halving): approx. unbiased for ||E G_c||^2, ||E G_pg||^2 and
+        <E G_c, E G_pg>. Halves are microbatch-contiguous, not group-aligned, so group-centered advantages
+        leave a small cross-half correlation; treat as approximate."""
+        if half_total is None or half_c is None:
+            return {}
+        ca = [h.float() * grad_scale for h in half_c]
+        cb = [c.float() - a for c, a in zip(g_c, ca, strict=True)]
+        ta = [h.float() * grad_scale for h in half_total]
+        tb = [t.float() - a for t, a in zip(g_total, ta, strict=True)]
+        pa = [t - center_scale * c for t, c in zip(ta, ca, strict=True)]
+        pb = [t - center_scale * c for t, c in zip(tb, cb, strict=True)]
+        return {
+            "split_c": 4 * self._dot(ca, cb),
+            "split_pg": 4 * self._dot(pa, pb),
+            "split_cross": 2 * (self._dot(ca, pb) + self._dot(pa, cb)),
+        }
+
     def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], center_scale: float) -> dict:
         """center_scale = lambda actually applied (0 for PG arms): G_total = G_pg + lambda * G_c."""
         g_c = [g.float().clone() for g in g_c]
