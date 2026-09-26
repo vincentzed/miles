@@ -36,7 +36,7 @@ from miles.utils.ray_utils import Box
 from miles.utils.timer import Timer, inverse_timer, timer
 from miles.utils.tracking_utils.tracking import init_tracking
 
-from . import checkpoint
+from . import checkpoint, sc_research
 from .adaptations.class_patches import apply_class_patches, apply_model_instance_patches
 from .adaptations.packing import apply_packing
 from .adaptations.post_load_fixups import apply_post_load_fixups
@@ -183,8 +183,15 @@ class FSDPTrainRayActor(TrainRayActor):
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+        elif args.optimizer == "sgd":
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=args.lr,
+                momentum=args.sgd_momentum,
+                weight_decay=args.weight_decay,
+            )
         else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'sgd'")
 
         # Initialize LR scheduler
         self.lr_scheduler = get_lr_scheduler(args, self.optimizer)
@@ -498,12 +505,20 @@ class FSDPTrainRayActor(TrainRayActor):
                 ref_results = self._compute_log_prob("ref", data_iterator, num_microbatches, store_prefix="ref_")
             rollout_data.update(ref_results)
 
-        with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
-            actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
-        routing_replay.rewind()
-        rollout_data.update(actor_results)
+        if self.args.sc_skip_old_logprob:
+            # The score-centering loss ratios use the recorded rollout logprobs only; the pre-update
+            # actor forward (~30% of step time) is unused. Keep the key for downstream consumers.
+            rollout_data["log_probs"] = rollout_data["rollout_log_probs"]
+        else:
+            with routing_replay.stage(routing_replay.log_prob_stage(self.args)):
+                actor_results = self._compute_log_prob("actor", data_iterator, num_microbatches)
+            routing_replay.rewind()
+            rollout_data.update(actor_results)
 
         compute_advantages_and_returns(self.args, rollout_data)
+        sc_research.apply_placebo_advantages(self.args, rollout_data, rollout_id)
+        if dist.get_rank() == 0:
+            sc_research.log_advantage_stats(self.args, rollout_data, rollout_id)
 
         log_rollout_data(rollout_id, self.args, rollout_data)
 
@@ -515,6 +530,7 @@ class FSDPTrainRayActor(TrainRayActor):
                 self.optimizer.zero_grad(set_to_none=True)
 
                 losses_reduced = []
+                normalizers = []
                 for _ in self.prof.iterate_train_actor(
                     tqdm(range(num_microbatches[step_id]), desc="actor_train", disable=dist.get_rank() != 0)
                 ):
@@ -542,12 +558,23 @@ class FSDPTrainRayActor(TrainRayActor):
                         get_position_ids=True,
                     )
 
-                    log_dict = self._train_step(
+                    log_dict, normalizer = self._train_step(
                         batch=batch,
                         step_id=step_id,
                         num_microbatches=num_microbatches[step_id],
                     )
                     losses_reduced.append(log_dict)
+                    normalizers.append(normalizer)
+
+                grad_scale = 1.0
+                if self.args.sc_token_mean_loss:
+                    assert self.args.calculate_per_token_loss, "--sc-token-mean-loss needs --calculate-per-token-loss"
+                    assert get_parallel_state().cp.size == 1, "--sc-token-mean-loss assumes no context parallelism"
+                    # Paper normalization: sum over the optimizer batch's tokens / total tokens.
+                    grad_scale = sc_research.token_mean_grad_scale(
+                        torch.stack(normalizers).sum(), dist.get_world_size()
+                    )
+                    sc_research.scale_grads(self.model, grad_scale)
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                 grad_norm = grad_norm.full_tensor().item()
@@ -616,7 +643,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         loss.backward()
 
-        return log_dict
+        return log_dict, normalizer
 
     @timer
     def update_weights(self, info: "UpdatableEngines") -> int | None:  # type: ignore[override]

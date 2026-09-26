@@ -1486,6 +1486,22 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Floor for the sampler tail mass in rho (default eps=1e-6; the paper's training code uses 0).",
             )
+            parser.add_argument(
+                "--sc-token-mean-loss",
+                action="store_true",
+                help="Paper normalization: divide the summed token loss by the optimizer batch's token count (FSDP).",
+            )
+            parser.add_argument("--sc-diag-path", type=str, default=None, help="jsonl sink for sc research diagnostics.")
+            parser.add_argument(
+                "--sc-placebo-advantage",
+                choices=["none", "plus_one", "minus_one", "random_sign"],
+                default="none",
+            )
+            parser.add_argument(
+                "--sc-zero-token-mean-adv",
+                action="store_true",
+                help="Shift advantages so the token-weighted mean advantage is 0 (removes the length-bias drift coefficient).",
+            )
             parser.add_argument("--sc-rollout-min-p", type=float, default=0.0, help="min_p for training rollouts.")
             parser.add_argument(
                 "--sc-filter-mode",
@@ -1502,6 +1518,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=1.0,
                 help="Multiply the centering term by lambda (causal control; 2 = equal-size drift, opposite sign).",
             )
+            parser.add_argument(
+                "--sc-skip-old-logprob",
+                action="store_true",
+                help="Skip the pre-update actor log-prob pass (unused by the score-centering loss).",
+            )
+            parser.add_argument("--sc-advantage-shift", type=float, default=0.0, help="Add a constant to advantages.")
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)

@@ -9,7 +9,8 @@ import yaml
 @dataclass
 class FSDPArgs:
     # Optim
-    optimizer: str = "adam"  # Optimizer type: "adam" (AdamW)
+    optimizer: str = "adam"  # Optimizer type: "adam" (AdamW) or "sgd"
+    sgd_momentum: float = 0.0
     lr: float = 2e-5
     lr_warmup_init: float = 0.0
     min_lr: float = 0.0
