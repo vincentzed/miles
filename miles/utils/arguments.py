@@ -1491,6 +1491,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 help="Paper normalization: divide the summed token loss by the optimizer batch's token count (FSDP).",
             )
+            parser.add_argument("--sc-drift-diag", action="store_true", help="Extra backward of the centering term.")
             parser.add_argument("--sc-diag-path", type=str, default=None, help="jsonl sink for sc research diagnostics.")
             parser.add_argument(
                 "--sc-placebo-advantage",

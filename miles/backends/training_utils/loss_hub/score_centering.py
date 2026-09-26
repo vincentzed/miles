@@ -67,6 +67,7 @@ def score_centering_loss(
     mis_high: float = 5.0,
     eps: float = 1e-6,
     center: bool = True,
+    center_only: bool = False,
     ppo_low: float = 0.8,
     ppo_high: float = 1.2,
     q_tail_floor: float | None = None,
@@ -136,6 +137,9 @@ def score_centering_loss(
     # center_scale (lambda) is a causal control: 0 = PG, 1 = SC, 2 = same-size drift of opposite sign.
     applied_correction = correction * center_scale if center else correction * 0.0
     loss = -advantages.detach() * (weight * train_log_probs - applied_correction)
+    if center_only:
+        # Research diagnostic: gradient of the centering term alone (G_c), independent of `center`.
+        loss = advantages.detach() * correction
     kl_q_p = (q * (rollout_head_log_probs.masked_fill(~head_mask, 0.0) - head_log_probs)).sum(-1) + (
         1 - q_mass
     ).clamp_min(0) * rho.clamp_min(1e-30).log()

@@ -152,6 +152,7 @@ def score_centering_loss_function(
         tis_clip=args.score_centering_tis_clip,
         mis_low=args.score_centering_mis_low,
         mis_high=args.score_centering_mis_high,
+        center_only=getattr(args, "sc_center_only", False),
         ppo_low=args.score_centering_ppo_low,
         ppo_high=args.score_centering_ppo_high,
         q_tail_floor=args.sc_q_tail_floor,

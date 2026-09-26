@@ -3,6 +3,8 @@
 Everything here is opt-in and inert unless the matching `--sc-*` flag is set:
 - paper loss normalization: sum over tokens / total tokens of the optimizer batch;
 - placebo advantages (constant or content-independent), for causal drift tests;
+- drift decomposition: one extra backward of the centering term per optimizer step, giving the
+  gradient split G_pg = G_sc - G_c and running sums / cross-step inner products;
 - a jsonl sink shared with the weight-sync hook (weight-noise projection diagnostics).
 """
 
@@ -236,3 +238,72 @@ class SamplerView:
             )
         append_diag(self.args, record)
 
+
+class DriftTracker:
+    """Split each step's gradient into the centering component G_c and the rest.
+
+    With the score-centering loss L = -A (w log p - c), G_total = G_pg + G_c where G_c = grad(A c).
+    For a PG arm (centering disabled) the applied gradient is G_pg; for an SC arm it is G_pg + G_c.
+    Under SGD, theta_T - theta_0 = -lr * sum_t G_t exactly, so the running sums of G_c and G_pg
+    give the accumulated drift vs signal displacement. Cross-step inner products use different
+    batches but are NOT unbiased: step t's weights depend on batch t-1, so E<G_t, G_{t-1}> carries an
+    O(lr * tr(H Sigma)) term. Treat them as descriptive; the sum-norm growth rate is the main statistic.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        params = [_local(p) for p in model.parameters()]
+        self.sum_c = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+        self.sum_pg = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+        self.prev_c = None
+        self.prev_pg = None
+        self.steps = 0
+
+    @staticmethod
+    def _dot(a: list[torch.Tensor], b: list[torch.Tensor]) -> float:
+        total = torch.zeros((), device=a[0].device, dtype=torch.float64)
+        for x, y in zip(a, b, strict=True):
+            total += (x.double() * y.double()).sum()
+        if dist.is_initialized():
+            dist.all_reduce(total)
+        return total.item()
+
+    def split_half(self, g_total, half_total, g_c, half_c, grad_scale, center_scale) -> dict:
+        """Cross-half products (x4 to undo the halving): approx. unbiased for ||E G_c||^2, ||E G_pg||^2 and
+        <E G_c, E G_pg>. Halves are microbatch-contiguous, not group-aligned, so group-centered advantages
+        leave a small cross-half correlation; treat as approximate."""
+        if half_total is None or half_c is None:
+            return {}
+        ca = [h.float() * grad_scale for h in half_c]
+        cb = [c.float() - a for c, a in zip(g_c, ca, strict=True)]
+        ta = [h.float() * grad_scale for h in half_total]
+        tb = [t.float() - a for t, a in zip(g_total, ta, strict=True)]
+        pa = [t - center_scale * c for t, c in zip(ta, ca, strict=True)]
+        pb = [t - center_scale * c for t, c in zip(tb, cb, strict=True)]
+        return {
+            "split_c": 4 * self._dot(ca, cb),
+            "split_pg": 4 * self._dot(pa, pb),
+            "split_cross": 2 * (self._dot(ca, pb) + self._dot(pa, cb)),
+        }
+
+    def observe(self, g_total: list[torch.Tensor], g_c: list[torch.Tensor], center_scale: float) -> dict:
+        """center_scale = lambda actually applied (0 for PG arms): G_total = G_pg + lambda * G_c."""
+        g_c = [g.float().clone() for g in g_c]
+        g_pg = [t.float() - center_scale * c for t, c in zip(g_total, g_c, strict=True)]
+        record = {
+            "g_c_sq": self._dot(g_c, g_c),
+            "g_pg_sq": self._dot(g_pg, g_pg),
+            "g_c_dot_g_pg": self._dot(g_c, g_pg),
+        }
+        if self.prev_c is not None:
+            record["g_c_cross_step"] = self._dot(g_c, self.prev_c)
+            record["g_pg_cross_step"] = self._dot(g_pg, self.prev_pg)
+        for s, g in zip(self.sum_c, g_c, strict=True):
+            s.add_(g)
+        for s, g in zip(self.sum_pg, g_pg, strict=True):
+            s.add_(g)
+        self.steps += 1
+        record["sum_c_sq"] = self._dot(self.sum_c, self.sum_c)
+        record["sum_pg_sq"] = self._dot(self.sum_pg, self.sum_pg)
+        record["sum_c_dot_sum_pg"] = self._dot(self.sum_c, self.sum_pg)
+        self.prev_c, self.prev_pg = g_c, g_pg
+        return record

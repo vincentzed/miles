@@ -79,6 +79,8 @@ def validate_score_centering_args(args: Namespace) -> None:
     if getattr(args, "sc_skip_old_logprob", False):
         assert args.loss_type == "score_centering" and args.use_rollout_logprobs and not args.use_kl_loss
         assert args.score_centering_is != "ppo_old", "ppo_old needs the pre-update actor pass"
+    if getattr(args, "sc_drift_diag", False):
+        assert args.entropy_coef == 0 and not args.use_kl_loss, "--sc-drift-diag assumes no entropy/KL regularizer"
     if getattr(args, "sc_placebo_advantage", "none") != "none":
         assert args.sc_token_mean_loss, "placebo advantages need the batch-wide token mean (else 1/L acts as a reward)"
     if getattr(args, "sc_weight_noise", 0.0) or getattr(args, "sc_stale_interval", 1) > 1:

@@ -198,6 +198,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.global_step = 0
         self.micro_step = 0
+        self._drift_tracker = sc_research.DriftTracker(self.model) if args.sc_drift_diag else None
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -531,6 +532,7 @@ class FSDPTrainRayActor(TrainRayActor):
 
                 losses_reduced = []
                 normalizers = []
+                step_batches = []
                 for _ in self.prof.iterate_train_actor(
                     tqdm(range(num_microbatches[step_id]), desc="actor_train", disable=dist.get_rank() != 0)
                 ):
@@ -565,6 +567,11 @@ class FSDPTrainRayActor(TrainRayActor):
                     )
                     losses_reduced.append(log_dict)
                     normalizers.append(normalizer)
+                    if self._drift_tracker is not None:
+                        step_batches.append(batch)
+                        if len(step_batches) == (num_microbatches[step_id] + 1) // 2:
+                            # split-half snapshot: gradient of the first half of the microbatches
+                            half_total = [None if g is None else g.clone() for g in sc_research.grads_of(self.model)]
 
                 grad_scale = 1.0
                 if self.args.sc_token_mean_loss:
@@ -575,6 +582,10 @@ class FSDPTrainRayActor(TrainRayActor):
                         torch.stack(normalizers).sum(), dist.get_world_size()
                     )
                     sc_research.scale_grads(self.model, grad_scale)
+                if self._drift_tracker is not None:
+                    self._observe_drift(
+                        rollout_id, step_id, step_batches, num_microbatches[step_id], grad_scale, half_total
+                    )
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                 grad_norm = grad_norm.full_tensor().item()
@@ -644,6 +655,38 @@ class FSDPTrainRayActor(TrainRayActor):
         loss.backward()
 
         return log_dict, normalizer
+
+    def _observe_drift(self, rollout_id, step_id, step_batches, num_microbatches, grad_scale, half_total) -> None:
+        """Extra backward of the centering term only; leaves the step's gradient untouched.
+
+        Split-half: the first ceil(n/2) microbatches form half a, the rest half b; cross-half inner products
+        estimate ||E G||^2 without the sampling-noise bias of a single batch's squared norm.
+        """
+        g_total = [None if g is None else g.clone() for g in sc_research.grads_of(self.model)]
+        self.optimizer.zero_grad(set_to_none=True)
+        n_a = (len(step_batches) + 1) // 2
+        self.args.sc_center_only = True
+        try:
+            for i, batch in enumerate(step_batches):
+                self._train_step(batch=batch, step_id=step_id, num_microbatches=num_microbatches)
+                if i == n_a - 1:
+                    half_c = [None if g is None else g.clone() for g in sc_research.grads_of(self.model)]
+        finally:
+            self.args.sc_center_only = False
+        sc_research.scale_grads(self.model, grad_scale)
+        g_c = sc_research.grads_of(self.model)
+        center_scale = 0.0 if self.args.disable_score_centering_correction else self.args.sc_center_scale
+        record = self._drift_tracker.observe(g_total, g_c, center_scale=center_scale)
+        record.update(
+            self._drift_tracker.split_half(g_total, half_total, g_c, half_c, grad_scale, center_scale)
+        )
+        record.update(kind="drift", rollout_id=rollout_id, step_id=step_id, lr=self.args.lr)
+        sc_research.append_diag(self.args, record)
+        for p, g in zip(self.model.parameters(), g_total, strict=True):
+            if g is None:
+                continue
+            assert p.grad is not None, "centering pass produced no gradient for a trained parameter"
+            sc_research._local(p.grad).copy_(g)
 
     @timer
     def update_weights(self, info: "UpdatableEngines", sc_mode: str = "normal") -> int | None:  # type: ignore[override]
