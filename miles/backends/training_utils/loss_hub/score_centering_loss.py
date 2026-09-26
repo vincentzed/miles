@@ -133,6 +133,13 @@ def score_centering_loss_function(
     advantages = torch.where(active, torch.cat(batch["advantages"]).detach(), 0.0)
     ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
     head = _local_candidates(args, batch, "rollout_topk_log_probs", logits.device)
+    if getattr(args, "sc_filter_mode", "none") == "post_renorm":
+        # Arm (e): the trainer is the filtered policy p^F = p restricted to the recorded support S and
+        # renormalized (the head holds exactly S), so every trainer logprob is shifted by logsumexp_S log p.
+        support = (ids >= 0) & active.unsqueeze(-1)
+        log_z = torch.logsumexp(torch.where(support, selected[:, 1:], -torch.inf), -1)
+        log_z = torch.where(support.any(-1), log_z, 0.0)
+        selected = selected - log_z.unsqueeze(-1)
     token_loss, metrics = score_centering_loss(
         selected[:, 0],
         selected[:, 1:],

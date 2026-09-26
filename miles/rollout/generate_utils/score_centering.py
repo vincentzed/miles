@@ -17,9 +17,20 @@ def configure_score_centering_request(args: Namespace, request: dict[str, Any], 
         return
     sampling = request if openai else request["sampling_params"]
     # Explicit defaults avoid model generation_config changing the distribution.
+    if getattr(args, "sc_rollout_min_p", 0.0):
+        sampling["min_p"] = args.sc_rollout_min_p
     for key, default in (("temperature", args.rollout_temperature), ("top_p", 1.0), ("top_k", -1), ("min_p", 0.0)):
         sampling.setdefault(key, default)
-    validate_score_centering_sampling(sampling, temperature=args.rollout_temperature)
+    filter_mode = getattr(args, "sc_filter_mode", "none")
+    if filter_mode == "none":
+        validate_score_centering_sampling(sampling, temperature=args.rollout_temperature)
+    elif filter_mode != "pre":  # "pre" = naive: pre-filter candidates used as if they were q (research arm)
+        if openai:
+            raise ValueError("Filtered score centering is only wired for native /generate")
+        # SGLang aborts sampling-mask requests without a finite top_k (scheduler.py:2787). Capping top_k at
+        # the recorded head width also guarantees support S ⊆ head, so q^F is reconstructed exactly.
+        sampling["top_k"] = k if sampling["top_k"] in (-1, 0) else min(sampling["top_k"], k)
+        request["return_sampling_mask"] = True
     if openai:
         request["top_logprobs"] = k
     else:
@@ -68,6 +79,45 @@ def append_score_centering_topk(sample: Sample, meta: Mapping[str, Any], k: int)
             if previous.shape != (prefix_length, k):
                 raise ValueError(f"Misaligned {field}: {previous.shape}, expected {(prefix_length, k)}")
             setattr(sample, field, np.concatenate((previous, values)))
+
+
+def apply_filtered_support(sample: Sample, meta: Mapping[str, Any], n: int) -> list[int]:
+    """Replace the last n rows of pre-filter candidates by the post-filter sampling distribution q^F.
+
+    SGLang returns top-k logprobs and the sampled-token logprob *before* top-p/top-k/min-p filtering,
+    plus (return_sampling_mask) the support S each token was actually drawn from. Every such filter keeps a
+    prefix of the probability-sorted vocabulary, so S is the first |S| candidates whenever |S| <= k; then
+    log q^F_v = log q_v - logsumexp_S log q for v in S and 0 mass elsewhere (exact). top_k is capped at k, so a
+    support token outside the recorded head only arises from ties/rounding at the head boundary (~1 position per
+    10^6); such positions must be dropped from the loss rather than centered against a partial support: their
+    response indices are returned (the caller zeroes them after updating loss_mask) and counted in
+    sample.metadata["sc_support_truncated"].
+    """
+    masks = meta.get("output_token_sampling_mask")
+    if masks is None or len(masks) != n:
+        raise ValueError("Filtered score centering needs output_token_sampling_mask for every generated token")
+    ids, logps = sample.rollout_topk_token_ids, sample.rollout_topk_log_probs
+    start = sample.response_length - n
+    dropped = []
+    for i, support in enumerate(masks):
+        row = start + i
+        head = {int(t): j for j, t in enumerate(ids[row]) if t >= 0}
+        keep = [head[int(t)] for t in support if int(t) in head]
+        if len(keep) < len(support):
+            dropped.append(row)
+            if not keep:
+                continue
+        lq = logps[row, keep].astype(np.float64)
+        log_z = float(np.logaddexp.reduce(lq))
+        new_ids = np.full(ids.shape[1], -1, dtype=np.int32)
+        new_lp = np.full(ids.shape[1], -np.inf, dtype=np.float32)
+        new_ids[: len(keep)] = ids[row, keep]
+        new_lp[: len(keep)] = (lq - log_z).astype(np.float32)
+        ids[row], logps[row] = new_ids, new_lp
+        sample.rollout_log_probs[row] = float(sample.rollout_log_probs[row] - log_z)
+    if dropped:
+        sample.metadata = {**(sample.metadata or {}), "sc_support_truncated": len(dropped)}
+    return dropped
 
 
 def append_score_centering_observations(sample: Sample, count: int) -> None:

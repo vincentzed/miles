@@ -8,7 +8,11 @@ from typing import Any
 import numpy as np
 import pybase64
 
-from miles.rollout.generate_utils.score_centering import append_score_centering_topk, configure_score_centering_request
+from miles.rollout.generate_utils.score_centering import (
+    append_score_centering_topk,
+    apply_filtered_support,
+    configure_score_centering_request,
+)
 from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
 from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
 from miles.utils.score_centering import score_centering_top_k
@@ -104,13 +108,21 @@ async def update_sample_from_response(
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
     sample.rollout_log_probs += new_response_log_probs
+    dropped = []
     if payload.get("top_logprobs_num"):
         append_score_centering_topk(sample, output["meta_info"], score_centering_top_k(args))
+        if payload.get("return_sampling_mask"):
+            dropped = apply_filtered_support(sample, output["meta_info"], len(new_response_tokens))
 
     if update_loss_mask:
         if sample.loss_mask is None:
             sample.loss_mask = []
         sample.loss_mask += [1] * len(new_response_tokens)
+    if dropped:  # positions whose sampling support left the recorded head (see apply_filtered_support)
+        if sample.loss_mask is None:
+            sample.loss_mask = [1] * sample.response_length
+        for row in dropped:
+            sample.loss_mask[row] = 0
 
     # TODO handle multi-turn cases (may need concat instead of assignment)
     sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
