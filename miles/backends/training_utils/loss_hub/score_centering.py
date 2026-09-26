@@ -72,6 +72,8 @@ def score_centering_loss(
     ppo_high: float = 1.2,
     q_tail_floor: float | None = None,
     center_scale: float = 1.0,
+    old_log_probs: torch.Tensor | None = None,
+    old_head_log_probs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Return unreduced token losses and detached token metrics.
 
@@ -99,6 +101,18 @@ def score_centering_loss(
             inside = (log_ratio >= math.log(mis_low)) & (log_ratio <= math.log(mis_high))
             weighted_q = torch.where(inside & head_mask, p, 0.0)
             alpha = ((rho >= 1 / mis_high) & (rho <= 1 / mis_low)).to(p.dtype)
+        elif mode == "ppo_old":
+            # PPO clipped against pi_old (trainer at batch start), rollouts from the sampler q. Weight
+            # w = r_old 1{band(r_old, sign A)}, r_old = p/pi_old; centering integrates q * w under q:
+            # head q_v p_v/pi_old_v in band; tail q = rho p, pi_old = rho_o p -> alpha = (rho/rho_o) 1{band(1/rho_o)}.
+            old_head = torch.where(head_mask, old_head_log_probs, 0.0)
+            log_r = head_log_probs - old_head
+            inside = ppo_in_band(log_r, positive, low=ppo_low, high=ppo_high)
+            weighted_q = torch.where(inside & head_mask, q * log_r.exp(), 0.0)
+            old_mass = old_head.exp().masked_fill(~head_mask, 0.0).sum(-1)
+            rho_o = (1 - old_mass).clamp_min(eps) / (1 - p_mass).clamp_min(eps)
+            tail_in = ppo_in_band(-rho_o.log(), positive, low=ppo_low, high=ppo_high).to(p.dtype)
+            alpha = rho / rho_o * tail_in
         elif mode == "ppo":
             # In band the effective mass q * (p/q) is p; out of band it is 0. The modeled tail has
             # constant ratio 1/rho, so alpha = rho * w(1/rho) = 1{1/rho in band}.
@@ -110,8 +124,8 @@ def score_centering_loss(
             raise ValueError(f"Unknown score-centering importance weighting: {mode}")
         residual = weighted_q - alpha.unsqueeze(-1) * p
         weight = importance_weights(
-            train_log_probs - rollout_log_probs,
-            mode,
+            train_log_probs - (old_log_probs if mode == "ppo_old" else rollout_log_probs),
+            "ppo" if mode == "ppo_old" else mode,
             tis_clip=tis_clip,
             mis_low=mis_low,
             mis_high=mis_high,

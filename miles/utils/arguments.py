@@ -1469,7 +1469,7 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--score-centering-is",
-                choices=["none", "tis", "mis", "ppo"],
+                choices=["none", "tis", "mis", "ppo", "ppo_old"],
                 default="none",
                 help="Importance weights to center together with the policy score.",
             )

@@ -20,6 +20,7 @@ from miles.backends.training_utils.log_utils import (
     log_train_step,
 )
 from miles.backends.training_utils.loss import compute_advantages_and_returns, get_log_probs_and_entropy, loss_function
+from miles.backends.training_utils.loss_hub.score_centering_loss import _candidate_log_probs as sc_candidate_log_probs
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
 from miles.ray.train_actor import TrainRayActor
 from miles.utils import async_utils, train_dump_utils, train_metric_utils
@@ -400,6 +401,8 @@ class FSDPTrainRayActor(TrainRayActor):
                             "response_lengths",
                             "max_seq_lens",
                         ]
+                        if store_prefix == "" and self.args.score_centering_is == "ppo_old":
+                            forward_only_keys.append("rollout_topk_token_ids")
                         batch = get_batch(
                             data_iterator,
                             forward_only_keys,
@@ -426,6 +429,12 @@ class FSDPTrainRayActor(TrainRayActor):
                         batch_result = {
                             f"{store_prefix}log_probs": result["log_probs"],
                         }
+                        if store_prefix == "" and self.args.score_centering_is == "ppo_old":
+                            # pi_old (trainer at batch start) on [sampled token + recorded head] for PPO
+                            # clipped against pi_old with sign-conditioned centering (research arm, #10).
+                            selected = sc_candidate_log_probs(self.args, batch, logits)["selected"]
+                            batch_result["old_token_log_probs"] = [s[:, 0].float().cpu() for s in selected]
+                            batch_result["old_topk_log_probs"] = [s[:, 1:].float().cpu() for s in selected]
                         if store_prefix == "" and "entropy" in result:
                             batch_result["entropy"] = result["entropy"]
                         forward_data_store.append(batch_result)
@@ -541,6 +550,8 @@ class FSDPTrainRayActor(TrainRayActor):
                             "rollout_log_probs",
                             "rollout_topk_token_ids",
                             "rollout_topk_log_probs",
+                            "old_token_log_probs",
+                            "old_topk_log_probs",
                         ],
                         self.args.data_pad_size_multiplier,
                         self.args.qkv_format,
