@@ -147,6 +147,8 @@ def score_centering_loss(
         "sc_train_head_mass": p_mass,
         "sc_rollout_head_mass": q_mass,
         "sc_tail_ratio": rho,
+        # sampler mass in its own top-128 (comparable across k; for k > 128 the head is sorted by q)
+        "sc_rollout_head_mass_top128": q[..., :128].sum(-1),
         # ||q_hat - p||_1 of the modeled sampler distribution (head exact, tail rho*p): the logit-space
         # size of the centering vector, i.e. the per-token drift magnitude.
         "sc_head_l1": (q - p).abs().sum(-1) + (rho - 1).abs() * (1 - p_mass).clamp_min(0),

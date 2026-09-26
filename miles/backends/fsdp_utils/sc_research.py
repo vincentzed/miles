@@ -148,6 +148,7 @@ class SamplerView:
         self._alias = {"lm_head.weight": "model.embed_tokens.weight"} if tied else {}
         self.deltas: dict[str, torch.Tensor] = {}
         self.theta0: dict[str, torch.Tensor] = {}
+        self._drawn_at: dict[str, int] = {}
         self.n_sham = 8  # independent never-applied directions: null distribution for the Delta-projection
         self.snapshot: dict[str, torch.Tensor] = {}
         self.normal_syncs = 0
@@ -171,12 +172,17 @@ class SamplerView:
         out = full.to(sent_dtype)
         if self.sigma:
             key = self._alias.get(name, name)
+            # --sc-noise-redraw: every refresh draws a fresh Delta (breaks the fixed-bias feedback loop)
+            if getattr(self.args, "sc_noise_redraw", False) and self._drawn_at.get(key) != self.normal_syncs:
+                self.deltas.pop(key, None)
             if key not in self.deltas:
-                seed = (self.args.sc_weight_noise_seed * 1_000_003 + zlib.crc32(key.encode())) % 2**63
+                redraw = self.normal_syncs if getattr(self.args, "sc_noise_redraw", False) else 0
+                seed = (self.args.sc_weight_noise_seed * 1_000_003 + zlib.crc32(key.encode()) + redraw * 7_919_111) % 2**63
+                self._drawn_at[key] = self.normal_syncs
                 generator = torch.Generator(device=full.device).manual_seed(seed)
                 eps = torch.randn(full.shape, generator=generator, device=full.device, dtype=torch.float32)
                 self.deltas[key] = (self.sigma * eps * full.float()).to(sent_dtype)
-                self.theta0[key] = full.detach().float().clone()
+                self.theta0.setdefault(key, full.detach().float().clone())
             if key == name:  # count tied weights once
                 delta = self.deltas[key].float()
                 disp = full.float() - self.theta0[key]

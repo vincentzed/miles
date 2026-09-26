@@ -1499,6 +1499,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default="none",
             )
             parser.add_argument("--sc-weight-noise-seed", type=int, default=0)
+            parser.add_argument(
+                "--sc-noise-redraw",
+                action="store_true",
+                help="Draw a fresh weight-noise Delta at every sampler refresh (control for the fixed-bias feedback loop).",
+            )
             parser.add_argument("--sc-rollout-min-p", type=float, default=0.0, help="min_p for training rollouts.")
             parser.add_argument(
                 "--sc-filter-mode",
