@@ -518,6 +518,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
         compute_advantages_and_returns(self.args, rollout_data)
         sc_research.apply_placebo_advantages(self.args, rollout_data, rollout_id)
+        if dist.get_rank() == 0:
+            sc_research.log_advantage_stats(self.args, rollout_data, rollout_id)
 
         log_rollout_data(rollout_id, self.args, rollout_data)
 

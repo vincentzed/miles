@@ -49,6 +49,23 @@ def token_mean_grad_scale(count: torch.Tensor, dp_size: int) -> float:
     return dp_size / max(count.item(), 1.0)
 
 
+def log_advantage_stats(args: Namespace, rollout_data: dict, rollout_id: int) -> None:
+    """Token-weighted mean advantage and Cov(A, L): with the batch token-mean loss the net drift weight is
+    sum_i A_i L_i, so its sign predicts the direction of drift (toward / away from the sampler)."""
+    if not getattr(args, "sc_diag_path", None):
+        return
+    adv = torch.tensor([float(a[0]) if len(a) else 0.0 for a in rollout_data["advantages"]], dtype=torch.float64)
+    lens = torch.tensor([float(x) for x in rollout_data["response_lengths"]], dtype=torch.float64)
+    record = {
+        "kind": "adv",
+        "rollout_id": rollout_id,
+        "token_weighted_adv": float((adv * lens).sum() / lens.sum().clamp_min(1)),
+        "cov_adv_len": float(((adv - adv.mean()) * (lens - lens.mean())).mean()),
+        "mean_len": float(lens.mean()),
+    }
+    append_diag(args, record)
+
+
 def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: int) -> None:
     """Replace advantages by a content-independent placebo.
 
@@ -131,7 +148,7 @@ class SamplerView:
         self._alias = {"lm_head.weight": "model.embed_tokens.weight"} if tied else {}
         self.deltas: dict[str, torch.Tensor] = {}
         self.theta0: dict[str, torch.Tensor] = {}
-        self.sham: dict[str, torch.Tensor] = {}  # never applied: null for the Delta-projection
+        self.n_sham = 8  # independent never-applied directions: null distribution for the Delta-projection
         self.snapshot: dict[str, torch.Tensor] = {}
         self.normal_syncs = 0
         self.mode = "normal"
@@ -143,7 +160,7 @@ class SamplerView:
         if mode == "normal":
             self.normal_syncs += 1
             self.refresh = (self.normal_syncs - 1) % self.interval == 0
-        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0, "sham_proj": 0.0, "sham_sq": 0.0}
+        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0}
 
     def transform(self, name: str, full: torch.Tensor, target_dtype: torch.dtype | None) -> torch.Tensor:
         sent_dtype = target_dtype or full.dtype
@@ -160,18 +177,18 @@ class SamplerView:
                 eps = torch.randn(full.shape, generator=generator, device=full.device, dtype=torch.float32)
                 self.deltas[key] = (self.sigma * eps * full.float()).to(sent_dtype)
                 self.theta0[key] = full.detach().float().clone()
-                sham = torch.Generator(device=full.device).manual_seed(seed ^ 0x5DEECE66D)
-                eps = torch.randn(full.shape, generator=sham, device=full.device, dtype=torch.float32)
-                self.sham[key] = (self.sigma * eps * full.float()).to(sent_dtype)
             if key == name:  # count tied weights once
                 delta = self.deltas[key].float()
                 disp = full.float() - self.theta0[key]
                 self._stats["proj"] += (disp * delta).sum().item()
                 self._stats["disp_sq"] += disp.square().sum().item()
                 self._stats["delta_sq"] += delta.square().sum().item()
-                sham = self.sham[key].float()
-                self._stats["sham_proj"] += (disp * sham).sum().item()
-                self._stats["sham_sq"] += sham.square().sum().item()
+                base = self.theta0[key] * self.sigma
+                for j in range(self.n_sham):
+                    g = torch.Generator(device=full.device).manual_seed((zlib.crc32(key.encode()) * 131 + j * 7919 + 17) % 2**63)
+                    sham = torch.randn(full.shape, generator=g, device=full.device, dtype=torch.float32) * base
+                    self._stats[f"sham_proj{j}"] = self._stats.get(f"sham_proj{j}", 0.0) + (disp * sham).sum().item()
+                    self._stats[f"sham_sq{j}"] = self._stats.get(f"sham_sq{j}", 0.0) + sham.square().sum().item()
             out = out + self.deltas[key]  # paper: bf16 weight + bf16 delta
         if self.fake_quant:
             # Re-applied on every sync, so the error tracks the current weights (paper: noise, then quant).
@@ -189,8 +206,7 @@ class SamplerView:
                 delta_cos=s["proj"] / max((s["disp_sq"] * s["delta_sq"]) ** 0.5, 1e-30),
                 disp_norm=s["disp_sq"] ** 0.5,
                 delta_norm=s["delta_sq"] ** 0.5,
-                sham_proj=s["sham_proj"] / max(s["sham_sq"], 1e-30),
-                sham_cos=s["sham_proj"] / max((s["disp_sq"] * s["sham_sq"]) ** 0.5, 1e-30),
+                sham_proj=[s.get(f"sham_proj{j}", 0.0) / max(s.get(f"sham_sq{j}", 0.0), 1e-30) for j in range(self.n_sham)],
             )
         append_diag(self.args, record)
 
