@@ -1,6 +1,7 @@
 import abc
 import logging
 import socket
+import zlib
 from argparse import Namespace
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -130,8 +131,25 @@ class UpdateWeight(abc.ABC):
                 param = param.wait()
             if target_dtype is not None and param.dtype != target_dtype:
                 param = param.to(target_dtype)
-            resolved.append((name, param))
+            resolved.append((name, self._maybe_add_weight_noise(name, param)))
         self.update_bucket_weights(resolved, weight_version=self.weight_version)
+
+    def _maybe_add_weight_noise(self, name: str, param: torch.Tensor) -> torch.Tensor:
+        """Synthetic training-inference mismatch (arXiv:2609.20807, Sec. 5.2).
+
+        The sampler receives theta + delta, where delta = sigma * eps * theta_0 is drawn once from
+        the weights of the first sync (the initial checkpoint) and held fixed for the whole run.
+        """
+        sigma = getattr(self.args, "sc_weight_noise", 0.0)
+        if not sigma:
+            return param
+        deltas = self.__dict__.setdefault("_weight_noise_deltas", {})
+        if name not in deltas:
+            seed = (self.args.seed * 1_000_003 + zlib.crc32(name.encode())) % 2**63
+            generator = torch.Generator(device=param.device).manual_seed(seed)
+            eps = torch.randn(param.shape, generator=generator, device=param.device, dtype=torch.float32)
+            deltas[name] = (sigma * eps * param.float()).to(param.dtype)
+        return param + deltas[name]
 
     @abc.abstractmethod
     def update_bucket_weights(self, named_tensors, weight_version=None) -> None:

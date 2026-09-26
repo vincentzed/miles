@@ -1478,6 +1478,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 help="Ablate only score centering while retaining identical importance weights and diagnostics.",
             )
+            parser.add_argument(
+                "--sc-weight-noise",
+                type=float,
+                default=0.0,
+                help=(
+                    "Research knob: add a fixed relative Gaussian offset sigma * eps * theta_0 to the weights "
+                    "sent to the rollout engine (synthetic training-inference mismatch). FSDP colocated only."
+                ),
+            )
             parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
             parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
             parser.add_argument("--score-centering-mis-high", type=float, default=5.0)

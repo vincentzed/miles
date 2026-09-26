@@ -182,8 +182,15 @@ class FSDPTrainRayActor(TrainRayActor):
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+        elif args.optimizer == "sgd":
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=args.lr,
+                momentum=args.sgd_momentum,
+                weight_decay=args.weight_decay,
+            )
         else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'sgd'")
 
         # Initialize LR scheduler
         self.lr_scheduler = get_lr_scheduler(args, self.optimizer)
