@@ -190,8 +190,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 momentum=args.sgd_momentum,
                 weight_decay=args.weight_decay,
             )
+        elif args.optimizer in ("muon", "adaptive_muon", "soap"):
+            # Research optimizers for the low-bit rollout study (sc_research.build_research_optimizer).
+            self.optimizer = sc_research.build_research_optimizer(self.model, args)
         else:
-            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'sgd'")
+            raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam', 'sgd', 'muon', 'adaptive_muon', 'soap'")
 
         # Initialize LR scheduler
         self.lr_scheduler = get_lr_scheduler(args, self.optimizer)

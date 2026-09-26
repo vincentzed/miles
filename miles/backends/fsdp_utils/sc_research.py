@@ -376,3 +376,64 @@ class DriftTracker:
         record["sum_c_dot_sum_pg"] = self._dot(self.sum_c, self.sum_pg)
         self.prev_c, self.prev_pg = g_c, g_pg
         return record
+
+
+class _Combined(torch.optim.Optimizer):
+    """A matrix optimizer for decoder-block weights + AdamW for everything else, behind one Optimizer interface (the LR
+    scheduler sees every param group)."""
+
+    def __init__(self, optimizers, local_pairs=()):
+        self.optimizers = optimizers
+        self.local_pairs = list(local_pairs)  # (FSDP param, detached local view) for optimizers that reject DTensors
+        self.param_groups = [g for o in optimizers for g in o.param_groups]
+        self.defaults = {}
+        self.state = {}
+
+    def step(self, closure=None):
+        for p, local in self.local_pairs:
+            local.grad = None if p.grad is None else _local(p.grad)
+        for o in self.optimizers:
+            o.step()
+        for _, local in self.local_pairs:
+            local.grad = None
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.optimizers:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self):
+        return {"optimizers": [o.state_dict() for o in self.optimizers]}
+
+    def load_state_dict(self, state):
+        for o, s in zip(self.optimizers, state["optimizers"], strict=True):
+            o.load_state_dict(s)
+
+
+def build_research_optimizer(model: torch.nn.Module, args: Namespace) -> torch.optim.Optimizer:
+    """The non-Adam optimizers miles exposes through Megatron (--optimizer muon | adaptive_muon | soap), built from the
+    same emerging_optimizers implementations, applied as Megatron does: the optimizer on decoder-block matrices, AdamW on
+    embeddings/head/norms. Megatron's defaults (momentum 0.95, spectral scale — per-weight update RMS ≈ lr, like Adam —
+    quintic Newton-Schulz, 5 steps, fp32 matmul precision "medium"); SOAP defaults (betas from args)."""
+    from emerging_optimizers.orthogonalized_optimizers import AdaptiveMuon, Muon
+    from emerging_optimizers.soap import SOAP
+
+    matrices, rest = [], []
+    for name, p in model.named_parameters():
+        (matrices if p.ndim == 2 and "layers." in name else rest).append(p)
+    # emerging_optimizers reject DTensors: step detached local views that share storage (single-rank runs: the local
+    # shard is the whole matrix, so orthogonalization sees the full weight).
+    assert not dist.is_initialized() or dist.get_world_size() == 1, "matrix optimizers need the full weight per rank"
+    pairs = [(p, _local(p).detach()) for p in matrices]
+    matrices = [local for _, local in pairs]
+    muon_kw = dict(lr=args.lr, momentum=0.95, weight_decay=args.weight_decay)  # Megatron defaults (spectral scale)
+    if args.optimizer == "muon":
+        main = Muon(matrices, **muon_kw)
+    elif args.optimizer == "adaptive_muon":
+        main = AdaptiveMuon(matrices, **muon_kw)
+    elif args.optimizer == "soap":
+        main = SOAP(matrices, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), weight_decay=args.weight_decay)
+    else:
+        raise ValueError(args.optimizer)
+    adamw = torch.optim.AdamW(rest, lr=args.lr, betas=(args.adam_beta1, args.adam_beta2), eps=args.adam_eps,
+                              weight_decay=args.weight_decay)
+    return _Combined([main, adamw], pairs)
