@@ -1533,6 +1533,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--sc-sampler-weight-quant-group", type=int, default=0)
             parser.add_argument(
+                "--sc-sampler-rounding",
+                choices=["rtn", "sr", "ef"],
+                default="rtn",
+                help="Rounding of the synced sampler weights: round-to-nearest, stochastic (fresh draw each sync), or "
+                "error feedback (sigma-delta: each sync's rounding residual is added before the next rounding).",
+            )
+            parser.add_argument(
                 "--sc-skip-old-logprob",
                 action="store_true",
                 help="Skip the pre-update actor log-prob pass (unused by the score-centering loss).",
@@ -1556,6 +1563,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="QAT-RL: trainer forward/backward through the sampler's weight fake quant (straight-through).",
             )
             parser.add_argument("--sc-trainer-weight-quant-group", type=int, default=0)
+            parser.add_argument(
+                "--sc-fp4-backward",
+                type=str,
+                default=None,
+                help="Emulated NVFP4 backward GEMMs for decoder linears: comma options rtn|sr|rht|sort|balance|"
+                "wgrad_bf16|dgrad_bf16 (miles/backends/fsdp_utils/fp4_backward.py).",
+            )
             parser.add_argument(
                 "--sc-quant-skip-embed",
                 action="store_true",

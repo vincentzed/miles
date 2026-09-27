@@ -116,12 +116,14 @@ def apply_placebo_advantages(args: Namespace, rollout_data: dict, rollout_id: in
 _FLOAT_GRIDS = {"fp8": (3, 448.0, -6), "fp6": (2, 28.0, -2), "fp4": (1, 6.0, 0)}
 
 
-def _snap_float(x: torch.Tensor, fmt: str) -> torch.Tensor:
+def _snap_float(x: torch.Tensor, fmt: str, u: torch.Tensor | None = None) -> torch.Tensor:
+    """Round to the float grid; with u ~ U[0,1) (same shape) round stochastically (unbiased: E[q] = x)."""
     man_bits, max_val, min_normal_exp = _FLOAT_GRIDS[fmt]
     ax = x.abs()
     exp = torch.floor(torch.log2(ax.clamp_min(1e-30)))
     quantum = torch.exp2(exp.clamp_min(min_normal_exp) - man_bits)
-    return torch.sign(x) * torch.minimum(torch.round(ax / quantum) * quantum, torch.tensor(max_val, device=x.device))
+    snapped = torch.round(ax / quantum) if u is None else torch.floor(ax / quantum + u)
+    return torch.sign(x) * torch.minimum(snapped * quantum, torch.tensor(max_val, device=x.device))
 
 
 def q_checksum(t: torch.Tensor) -> int:
@@ -144,12 +146,14 @@ def _act46_masks() -> dict:
     return _ACT46_MASKS
 
 
-def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0, skip_embed: bool = False) -> torch.Tensor:
+def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0, skip_embed: bool = False,
+                         generator: torch.Generator | None = None) -> torch.Tensor:
     """Weight-only quantize-dequantize, port of the paper's fake_quantize_tree (models/quant.py).
 
     Symmetric absmax scale per output row over the contraction (last) axis, optionally in groups.
     Skips 1-D tensors, norms, biases and MoE routers; with skip_embed also the token embedding and LM head
     (standard W4A16 practice). fmt: int8 | int4 | intN | fp8 | fp6 | fp4.
+    With a generator, element rounding is stochastic (int*, nvfp4, fp8/fp6/fp4; scales stay deterministic).
     """
     if w.ndim <= 1 or "norm" in name or "bias" in name or name.endswith("mlp.gate.weight"):
         return w
@@ -160,10 +164,13 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
     g = group_size or k
     assert k % g == 0, f"{name}: contraction {k} not divisible by group {g}"
     x = w.float().reshape(*shape[:-1], k // g, g)
+    u = None if generator is None else torch.rand(x.shape, generator=generator, device=x.device, dtype=torch.float32)
+    if u is not None:
+        assert fmt.startswith("int") or fmt in ("nvfp4", "nvfp4_2d", *_FLOAT_GRIDS), f"stochastic rounding not implemented for {fmt}"
     if fmt.startswith("int"):
         qmax = float(2 ** (int(fmt[3:]) - 1) - 1)
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / qmax
-        q = torch.round(x / scale).clamp(-qmax, qmax)
+        q = (torch.round(x / scale) if u is None else torch.floor(x / scale + u)).clamp(-qmax, qmax)
     elif fmt == "nvfp4te46act":
         # Activation-aware Four-Over-Six: a fixed per-block mask (computed once from base-model calibration activations,
         # scripts/make_46act_mask.py) picks the 4/6 result or standard NVFP4 per 16-element block.
@@ -188,16 +195,23 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
                if fmt == "nvfp4te46" else NVFP4QDQConfig())
         x2 = w.reshape(-1, k).contiguous()
         return fused_nvfp4_qdq(x2, compute_nvfp4_amax(x2), cfg).reshape(shape).to(w.dtype)
+    elif fmt == "nvfp4_2d":
+        assert g == 16 and w.ndim == 2 and shape[0] % 16 == 0, "nvfp4_2d uses 16x16 weight tiles"
+        t = w.float().reshape(shape[0] // 16, 16, k // 16, 16)
+        tensor_scale = t.abs().amax().clamp_min(1e-30) / (6.0 * 448.0)
+        block = (t.abs().amax(dim=(1, 3), keepdim=True) / 6.0 / tensor_scale).to(torch.float8_e4m3fn).float()
+        scale = (block * tensor_scale).clamp_min(1e-30)
+        return (_snap_float(t / scale, "fp4", None if u is None else u.reshape(t.shape)) * scale).reshape(shape).to(w.dtype)
     elif fmt == "nvfp4":
         # NVFP4-like: E2M1 values, per-16 block scales stored in E4M3, one fp32 per-tensor scale (amax / (6 * 448)).
         assert g == 16, "nvfp4 uses 16-element blocks"
         tensor_scale = x.abs().amax().clamp_min(1e-30) / (6.0 * 448.0)
         block = (x.abs().amax(-1, keepdim=True) / 6.0 / tensor_scale).to(torch.float8_e4m3fn).float()
         scale = (block * tensor_scale).clamp_min(1e-30)
-        q = _snap_float(x / scale, "fp4")
+        q = _snap_float(x / scale, "fp4", u)
     else:
         scale = x.abs().amax(-1, keepdim=True).clamp_min(1e-30) / _FLOAT_GRIDS[fmt][1]
-        q = _snap_float(x / scale, fmt)
+        q = _snap_float(x / scale, fmt, u)
     return (q * scale).reshape(shape).to(w.dtype)
 
 
@@ -220,6 +234,12 @@ class SamplerView:
         self.fake_quant = getattr(args, "sc_sampler_weight_quant", None)
         self.fake_quant_group = getattr(args, "sc_sampler_weight_quant_group", 0)
         self.skip_embed = getattr(args, "sc_quant_skip_embed", False)
+        # --sc-sampler-rounding: rtn (deterministic), sr (fresh stochastic rounding every sync: E[Q(theta)] = theta),
+        # ef (error feedback / sigma-delta: carry each sync's rounding residual into the next, so the running mean
+        # of the sent weights tracks theta and sub-grid learning is not lost)
+        self.rounding = getattr(args, "sc_sampler_rounding", "rtn")
+        self.residual: dict[str, torch.Tensor] = {}
+        self._resid_prev: dict[str, torch.Tensor] = {}
         # --sc-eval-quant fmt:group: an eval-only quantized view of the current weights (for bf16-rollout runs)
         eval_quant = getattr(args, "sc_eval_quant", None)
         self.eval_quant = (eval_quant.split(":")[0], int(eval_quant.split(":")[1])) if eval_quant else None
@@ -241,7 +261,8 @@ class SamplerView:
         if mode == "normal":
             self.normal_syncs += 1
             self.refresh = (self.normal_syncs - 1) % self.interval == 0
-        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0}
+            self._resid_prev = dict(self.residual)  # EF: tied names (embed/lm_head) must see the same residual
+        self._stats = {"proj": 0.0, "disp_sq": 0.0, "delta_sq": 0.0, "qerr_sq": 0.0, "resid_sq": 0.0, "w_sq": 0.0}
 
     def transform(self, name: str, full: torch.Tensor, target_dtype: torch.dtype | None) -> torch.Tensor:
         sent_dtype = target_dtype or full.dtype
@@ -281,7 +302,25 @@ class SamplerView:
             out = out + self.deltas[key]  # paper: bf16 weight + bf16 delta
         if self.fake_quant:
             # Re-applied on every sync, so the error tracks the current weights (paper: noise, then quant).
-            out = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group, self.skip_embed)
+            key = self._alias.get(name, name)
+            sync_step = self.mode == "normal" and self.refresh
+            if self.rounding == "ef" and sync_step:
+                target = out.float() + self._resid_prev.get(key, 0.0)
+                q = fake_quantize_weight(name, target.to(sent_dtype), self.fake_quant, self.fake_quant_group, self.skip_embed)
+                if name != "lm_head.weight":
+                    self.residual[key] = target - q.float()
+                    self._stats["resid_sq"] += self.residual[key].square().sum().item()
+                out_q = q
+            elif self.rounding == "sr" and sync_step:
+                seed = (getattr(self.args, "seed", 0) * 1_000_003 + zlib.crc32(key.encode()) + self.normal_syncs * 7_919_111) % 2**63
+                gen = torch.Generator(device=out.device).manual_seed(seed)
+                out_q = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group, self.skip_embed, generator=gen)
+            else:
+                out_q = fake_quantize_weight(name, out, self.fake_quant, self.fake_quant_group, self.skip_embed)
+            if sync_step and name != "lm_head.weight" and out_q.ndim == 2:
+                self._stats["qerr_sq"] += (out_q.float() - full.float()).square().sum().item()
+                self._stats["w_sq"] += full.float().square().sum().item()
+            out = out_q
             if self.mode == "normal" and self.refresh and name != "lm_head.weight":  # tied head counted once
                 self._stats["q_checksum"] = self._stats.get("q_checksum", 0) + q_checksum(out)
         if self.keep_snapshot:
@@ -301,6 +340,10 @@ class SamplerView:
             )
         if "q_checksum" in self._stats:
             record["q_checksum"] = self._stats["q_checksum"]
+        if self.fake_quant and self.mode == "normal" and self.refresh:
+            s = self._stats
+            record.update(rounding=self.rounding, rel_qerr=(s["qerr_sq"] / max(s["w_sq"], 1e-30)) ** 0.5,
+                          rel_resid=(s["resid_sq"] / max(s["w_sq"], 1e-30)) ** 0.5)
         append_diag(self.args, record)
 
 

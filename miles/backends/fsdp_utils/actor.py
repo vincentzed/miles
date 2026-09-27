@@ -209,6 +209,11 @@ class FSDPTrainRayActor(TrainRayActor):
             if args.sc_trainer_weight_quant
             else None
         )
+        if getattr(args, "sc_fp4_backward", None):  # emulated NVFP4 dgrad/wgrad GEMMs (fp4_backward.py)
+            from miles.backends.fsdp_utils import fp4_backward  # optional research path, loaded only when enabled
+
+            n = fp4_backward.install(self.model, args.sc_fp4_backward, seed=args.seed)
+            logger.info(f"sc_fp4_backward={args.sc_fp4_backward}: {n} decoder linears use emulated NVFP4 backward GEMMs")
 
         checkpoint_payload = checkpoint.load(self)
 
