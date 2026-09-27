@@ -1564,6 +1564,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument("--sc-trainer-weight-quant-group", type=int, default=0)
             parser.add_argument(
+                "--sc-quant-bf16-from-layer",
+                type=int,
+                default=None,
+                help="Keep decoder layers >= K in BF16 in all weight fake quant (sampler, trainer QAT, eval views).",
+            )
+            parser.add_argument(
                 "--sc-fp4-backward",
                 type=str,
                 default=None,

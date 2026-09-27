@@ -146,6 +146,14 @@ def _act46_masks() -> dict:
     return _ACT46_MASKS
 
 
+_BF16_FROM_LAYER: int | None = None  # --sc-quant-bf16-from-layer K: decoder layers >= K stay BF16 (miles "last 15%")
+
+
+def set_bf16_from_layer(k: int | None) -> None:
+    global _BF16_FROM_LAYER
+    _BF16_FROM_LAYER = k
+
+
 def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int = 0, skip_embed: bool = False,
                          generator: torch.Generator | None = None) -> torch.Tensor:
     """Weight-only quantize-dequantize, port of the paper's fake_quantize_tree (models/quant.py).
@@ -159,6 +167,9 @@ def fake_quantize_weight(name: str, w: torch.Tensor, fmt: str, group_size: int =
         return w
     if skip_embed and ("embed_tokens" in name or "lm_head" in name):
         return w
+    if _BF16_FROM_LAYER is not None and ".layers." in name:
+        if int(name.split(".layers.")[1].split(".")[0]) >= _BF16_FROM_LAYER:
+            return w
     shape = w.shape
     k = shape[-1]
     g = group_size or k

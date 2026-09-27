@@ -202,6 +202,7 @@ class FSDPTrainRayActor(TrainRayActor):
         self.global_step = 0
         self.micro_step = 0
         self._drift_tracker = sc_research.DriftTracker(self.model) if args.sc_drift_diag else None
+        sc_research.set_bf16_from_layer(getattr(args, "sc_quant_bf16_from_layer", None))
         self._trainer_fq = (
             sc_research.TrainerFakeQuant(
                 self.model, args.sc_trainer_weight_quant, args.sc_trainer_weight_quant_group, args.sc_quant_skip_embed
