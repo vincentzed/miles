@@ -17,7 +17,7 @@ Options (comma list, e.g. "rtn", "sr", "rht,sr", "sort", "sort,balance"):
   wgrad_bf16 / dgrad_bf16   keep that GEMM in BF16 (ablations)
   dgrad_fp8  dgrad GEMM operands in FP8 E4M3 with per-32-element block scales (MXFP8-like) instead of FP4
   real     run the backward GEMMs on real TE NVFP4 kernels (TE quantizers + general_gemm, the calls TE Linear makes)
-           instead of quantize-dequantize + BF16 matmul; supports rtn with 1D blocks and dgrad_fp8 (MXFP8) /
+           instead of quantize-dequantize + BF16 matmul; supports rtn or sr (dy) with 1D blocks and dgrad_fp8 (MXFP8) /
            wgrad_bf16 / dgrad_bf16 / layers=
   layers=a-b  only decoder layers a..b (inclusive) use the emulated backward; the rest keep BF16 backward
   wfwd     dgrad reuses the forward weight as is (it must already be on a 16x16 grid, e.g. QAT with nvfp4_2d), which is
@@ -123,7 +123,8 @@ def _real_backward(cfg, x2, w, dy2, need_dx, need_dw, key=None):
     xp = torch.nn.functional.pad(x2, (0, 0, 0, pad)) if pad else x2
     dgrad4 = need_dx and not ({"dgrad_bf16", "dgrad_fp8"} & cfg.opts)
     wgrad4 = need_dw and "wgrad_bf16" not in cfg.opts
-    dy_q = NVFP4Quantizer(rowwise=dgrad4, columnwise=wgrad4)(dyp.contiguous()) if (dgrad4 or wgrad4) else None
+    sr = "sr" in cfg.opts  # stochastic rounding of the gradient operand (TE NVFP4 quantizer option)
+    dy_q = NVFP4Quantizer(rowwise=dgrad4, columnwise=wgrad4, stochastic_rounding=sr)(dyp.contiguous()) if (dgrad4 or wgrad4) else None
     dx = dw = None
     if need_dx:
         if "dgrad_bf16" in cfg.opts:
