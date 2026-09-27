@@ -15,6 +15,8 @@ Options (comma list, e.g. "rtn", "sr", "rht,sr", "sort", "sort,balance"):
            blocks round the small ones to zero
   balance  rescale token t by c_t = sqrt(||x_t|| / ||dy_t||) on dy and 1/c_t on x before wgrad quantization (exact)
   wgrad_bf16 / dgrad_bf16   keep that GEMM in BF16 (ablations)
+  dgrad_fp8  dgrad GEMM operands in FP8 E4M3 with per-32-element block scales (MXFP8-like) instead of FP4
+  layers=a-b  only decoder layers a..b (inclusive) use the emulated backward; the rest keep BF16 backward
   wfwd     dgrad reuses the forward weight as is (it must already be on a 16x16 grid, e.g. QAT with nvfp4_2d), which is
            what TE's 2D weight quantization gives: one quantization serves fprop and dgrad (chain-rule consistent)
 """
@@ -48,10 +50,22 @@ def _qdq_rows(t: torch.Tensor, generator: torch.Generator | None = None) -> torc
     return q[..., :k] if pad else q
 
 
+def _qdq_rows_fp8(t: torch.Tensor) -> torch.Tensor:
+    """FP8 E4M3 QDQ with per-32-element block absmax scales along the last dim."""
+    k = t.shape[-1]
+    pad = (-k) % 32
+    if pad:
+        t = torch.nn.functional.pad(t, (0, pad))
+    q = fake_quantize_weight("fp8bwd", t.to(torch.bfloat16).contiguous(), "fp8", 32)
+    return q[..., :k] if pad else q
+
+
 class FP4BackwardConfig:
     def __init__(self, spec: str, seed: int = 0):
-        self.opts = {o.strip() for o in spec.split(",") if o.strip()}
-        unknown = self.opts - {"rtn", "sr", "rht", "sort", "balance", "wgrad_bf16", "dgrad_bf16", "wfwd"}
+        self.opts = {o.strip() for o in spec.split(",") if o.strip() and not o.strip().startswith("layers=")}
+        rng = [o.strip()[7:] for o in spec.split(",") if o.strip().startswith("layers=")]
+        self.layers = tuple(int(v) for v in rng[0].split("-")) if rng else None
+        unknown = self.opts - {"rtn", "sr", "rht", "sort", "balance", "wgrad_bf16", "dgrad_bf16", "wfwd", "dgrad_fp8"}
         assert not unknown, f"unknown fp4 backward options {unknown}"
         self.seed = seed
         self.calls = 0
@@ -82,8 +96,12 @@ class _FP4BwdLinear(torch.autograd.Function):
             if "dgrad_bf16" in cfg.opts:
                 dx = dy2 @ w.to(dy2.dtype)
             else:  # dy rows along out-dim; W along out-dim = rows of W^T
-                dyq = _qdq_rows(dy2, cfg.gen(dy2.device))
-                wq = w if "wfwd" in cfg.opts else _qdq_rows(w.t().contiguous()).t()
+                if "dgrad_fp8" in cfg.opts:
+                    dyq = _qdq_rows_fp8(dy2)
+                    wq = _qdq_rows_fp8(w.t().contiguous()).t()
+                else:
+                    dyq = _qdq_rows(dy2, cfg.gen(dy2.device))
+                    wq = w if "wfwd" in cfg.opts else _qdq_rows(w.t().contiguous()).t()
                 dx = (dyq.float() @ wq.float()).to(dy2.dtype)
             dx = dx.reshape(shape)
         if ctx.needs_input_grad[1]:
@@ -123,6 +141,10 @@ def install(model: torch.nn.Module, spec: str, seed: int = 0, include=("q_proj",
     count = 0
     for name, mod in model.named_modules():
         if isinstance(mod, torch.nn.Linear) and mod.bias is None and name.split(".")[-1] in include and ".layers." in f".{name}":
+            if cfg.layers is not None:
+                idx = int(name.split(".layers.")[1].split(".")[0])
+                if not cfg.layers[0] <= idx <= cfg.layers[1]:
+                    continue
             def fwd(x, _m=mod):
                 return _FP4BwdLinear.apply(x, _m.weight, cfg)
             mod.forward = fwd
