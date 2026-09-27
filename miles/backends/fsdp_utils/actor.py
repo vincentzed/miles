@@ -613,6 +613,10 @@ class FSDPTrainRayActor(TrainRayActor):
                 grad_norm = grad_norm.full_tensor().item()
 
                 self.optimizer.step()
+                if getattr(self.args, "sc_fp4_backward", None):
+                    from miles.backends.fsdp_utils import fp4_backward  # weights changed: drop cached FP4 weight quantizations
+
+                    fp4_backward.new_optimizer_step()
                 self.lr_scheduler.step()
 
                 if self.args.ci_test:
